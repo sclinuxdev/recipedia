@@ -47,8 +47,10 @@ pub fn remote_head(git_url: &str) -> Result<String> {
 /// Walk every recipe.toml under the mirror and parse it. Both tree shapes are
 /// accepted: the current flat `<name>/<ver>-<rel>/recipe.toml` (category
 /// `misc`) and the nine-category `<cat>/<name>/<ver>-<rel>/recipe.toml`.
-pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<String, RecipeRecord>> {
-    let mut out: BTreeMap<String, RecipeRecord> = BTreeMap::new();
+/// A package may keep several version directories side by side; only a true
+/// collision (same name+version+release in two places) is rejected.
+pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<(String, String, String), RecipeRecord>> {
+    let mut out: BTreeMap<(String, String, String), RecipeRecord> = BTreeMap::new();
     let mut stack = vec![git_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).with_context(|| dir.display().to_string())? {
@@ -61,15 +63,22 @@ pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<String, RecipeRecord>>
                 stack.push(path);
             } else if path.file_name().is_some_and(|n| n == "recipe.toml") {
                 let record = parse_recipe_at(git_dir, &path)?;
-                if let Some(dup) = out.get(&record.recipe.name) {
+                let key = (
+                    record.recipe.name.clone(),
+                    record.recipe.version.clone(),
+                    record.recipe.release.clone(),
+                );
+                if let Some(dup) = out.get(&key) {
                     bail!(
-                        "duplicate package name '{}' at {} and {}",
+                        "duplicate package '{}-{}-{}' at {} and {}",
                         record.recipe.name,
+                        record.recipe.version,
+                        record.recipe.release,
                         dup.recipe_path,
                         record.recipe_path
                     );
                 }
-                out.insert(record.recipe.name.clone(), record);
+                out.insert(key, record);
             }
         }
     }

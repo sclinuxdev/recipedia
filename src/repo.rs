@@ -93,6 +93,40 @@ pub fn read_manifest_meta(archive: &Path) -> Result<ManifestMeta> {
     bail!("archive has no .METADATA/manifest.toml");
 }
 
+/// Pull the `.METADATA/files.idx` inventory (TSV: type/mode/size/sha256/path/
+/// target) out of an archive; only what browsing needs is kept.
+pub fn read_file_list(archive: &Path) -> Result<Vec<db::FileLine>> {
+    let file = std::fs::File::open(archive)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut tar = tar::Archive::new(decoder);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        if path.file_name().is_some_and(|n| n == "files.idx")
+            && path.parent().is_some_and(|d| d.ends_with(".METADATA"))
+        {
+            let mut text = String::new();
+            entry.read_to_string(&mut text)?;
+            return Ok(text
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| {
+                    let cols: Vec<&str> = l.split('\t').collect();
+                    if cols.len() < 5 {
+                        return None;
+                    }
+                    Some(db::FileLine {
+                        kind: cols[0].to_string(),
+                        size: cols[2].parse().unwrap_or(0),
+                        path: cols[4].to_string(),
+                    })
+                })
+                .collect());
+        }
+    }
+    Ok(Vec::new()) // legacy archives without files.idx
+}
+
 fn parse_manifest(text: &str) -> Result<ManifestMeta> {
     let doc: toml::Table = toml::from_str(text).context("manifest.toml is not valid TOML")?;
     let pkg = doc
@@ -161,11 +195,14 @@ pub fn ingest(
         }
     }
     let meta = read_manifest_meta(tmp_path)?;
+    // File list is best-effort: legacy archives without files.idx still publish.
+    let files = read_file_list(tmp_path).unwrap_or_default();
     let size = std::fs::metadata(tmp_path)?.len();
     let dest = cfg.repo_dir.join(filename);
     std::fs::rename(tmp_path, &dest)
         .with_context(|| format!("cannot move upload into {}", dest.display()))?;
     db::upsert_published(conn, filename, &meta, size as i64, sha256, builder)?;
+    db::replace_published_files(conn, filename, &files)?;
     regenerate_index(conn, cfg)?;
 
     let recipe = db::package_by_name(conn, &meta.name)?;
@@ -184,11 +221,29 @@ pub fn ingest(
     })
 }
 
+/// Withdraw a published artifact: DB rows, build log, on-disk file, re-index.
+pub fn unpublish(conn: &rusqlite::Connection, cfg: &Config, filename: &str) -> Result<()> {
+    if !valid_filename(filename) {
+        bail!("invalid package filename '{filename}'");
+    }
+    let existed = db::delete_published(conn, filename)?;
+    if !existed {
+        bail!("'{filename}' is not published");
+    }
+    match std::fs::remove_file(cfg.repo_dir.join(filename)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("cannot remove repository file"),
+    }
+    regenerate_index(conn, cfg)?;
+    Ok(())
+}
+
 /// Rebuild `index.toml` from the published table, byte-compatible with what
 /// `sage repo index` emits (schema_version 1 + [[packages]] rows).
 pub fn regenerate_index(conn: &rusqlite::Connection, cfg: &Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.repo_dir)?;
-    let mut out = String::from("schema_version = 1\n\n[channel]\nname = \"shenchen\"\n");
+    let mut out = String::from("schema_version = 1\n\n[channel]\nname = \"sclinux\"\n");
     out.push_str(&format!("updated_at = \"{}\"\n\n", rfc3339_now()));
 
     for row in db::index_rows(conn)? {
@@ -271,26 +326,9 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// RFC3339 UTC timestamp without pulling in chrono (civil-from-days).
+/// RFC3339 UTC timestamp for index.toml's updated_at.
 fn rfc3339_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = (secs / 86400) as i64;
-    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    db::time_utc(db::now())
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Recipedia -- ShenChen Linux recipe & repository hub.
+//! Recipedia -- sclinux recipe & repository hub.
 //!
 //! Read-only presentation of the sclinuxdev/recipes git tree plus built-in
 //! hosting of published binary packages. The git repo is the single source of
@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod db;
+pub mod graph;
 pub mod model;
 pub mod repo;
 pub mod status;

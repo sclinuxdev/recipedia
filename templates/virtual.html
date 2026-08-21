@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ name }}{% endblock %}
+{% block content %}
+<h1><span class="mono">{{ name }}</span> <span class="badge st-missing">virtual</span></h1>
+
+<p>No recipe is named <code>{{ name }}</code> — it exists only as a <code>provides</code>
+entry. These packages supply it:</p>
+
+<table>
+  <tr><th>Provider</th><th>Version</th><th>State</th></tr>
+  {% for p in providers %}
+  <tr>
+    <td class="mono"><a href="/package/{{ p.name }}">{{ p.name }}</a></td>
+    <td class="mono">{{ p.repo_version }}</td>
+    <td><span class="badge st-{{ p.state.label() }}">{{ p.state.label() }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

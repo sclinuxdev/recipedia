@@ -9,12 +9,6 @@
 <h2>Details</h2>
 <table>
   <tr><th>Recipe version</th><td class="mono">{{ pkg.version }}-{{ pkg.release }}</td></tr>
-  {% match published %}
-  {% when Some(p) %}
-  <tr><th>Repo version</th><td class="mono">{{ p.version }}-{{ p.release }}
-      <span class="muted">({{ p.filename }})</span></td></tr>
-  {% when None %}
-  {% endmatch %}
   <tr><th>Category</th><td><a href="/category/{{ pkg.category }}">{{ pkg.category }}</a></td></tr>
   <tr><th>Channel</th><td class="mono">{{ pkg.channel }}</td></tr>
   <tr><th>License</th><td>{{ pkg.license }}</td></tr>
@@ -24,6 +18,35 @@
   {% endif %}
   <tr><th>Recipe</th><td class="mono"><a href="{{ github_url }}">{{ pkg.recipe_path }}</a></td></tr>
 </table>
+
+{% if !published.is_empty() %}
+<h2>Published builds</h2>
+<table>
+  <tr><th>Version</th><th>File</th><th>Size</th><th>Published</th></tr>
+  {% for p in published %}
+  <tr>
+    <td class="mono">{{ p.version }}-{{ p.release }}</td>
+    <td class="mono"><a href="/repo/{{ p.filename }}">{{ p.filename }}</a></td>
+    <td class="mono muted">{{ p.size_mib() }} MiB</td>
+    <td class="mono muted">{{ p.built_at() }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if !versions.is_empty() && versions.len() > 1 %}
+<h2>Recipe versions ({{ versions.len() }})</h2>
+<p>Older recipes stay in the tree under their own version directory; the newest one is what lists and the status board show.</p>
+<table>
+  <tr><th>Version</th><th>recipe.toml</th></tr>
+  {% for v in versions %}
+  <tr>
+    <td class="mono">{{ v.version }}-{{ v.release }}{% if v.latest %} <span class="badge st-built">latest</span>{% endif %}</td>
+    <td class="mono"><a href="{{ v.github_url }}">{{ v.github_url }}</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
 
 <h2>Dependencies</h2>
 <table>
@@ -56,6 +79,32 @@
 {% if !pkg.conffiles.is_empty() %}
 <h2>Conffiles</h2>
 <p>{% for c in pkg.conffiles %}<span class="mono">{{ c }}</span>{{ " " }}{% endfor %}</p>
+{% endif %}
+
+{% if !files.is_empty() %}
+<h2>Files ({{ files_total }})</h2>
+<table>
+  <tr><th>Path</th><th>Type</th><th>Size</th></tr>
+  {% for f in files %}
+  <tr>
+    <td class="mono">{{ f.path }}</td>
+    <td class="muted">{{ f.kind }}</td>
+    <td class="mono muted">{{ f.size }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if files_total > files.len() %}
+<p class="muted">… and {{ files_total - files.len() }} more — see the full <code>files.idx</code> in the archive.</p>
+{% endif %}
+{% endif %}
+
+{% if has_log %}
+<h2>Build log</h2>
+<p class="muted">uploaded by {{ log_builder }}</p>
+<details>
+  <summary>show build log</summary>
+  <pre class="recipe">{{ log_content }}</pre>
+</details>
 {% endif %}
 
 <h2>recipe.toml</h2>

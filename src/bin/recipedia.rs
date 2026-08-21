@@ -87,6 +87,7 @@ fn run() -> Result<()> {
     match cmd.as_str() {
         "login" => login(args),
         "publish" => publish(args),
+        "unpublish" => unpublish(args),
         "status" => status(args),
         "--help" | "-h" | "help" => {
             print_usage();
@@ -98,11 +99,14 @@ fn run() -> Result<()> {
 
 fn print_usage() {
     println!(
-        "recipedia — ShenChen Linux package publisher\n\n\
+        "recipedia — sclinux package publisher\n\n\
          USAGE:\n  \
          recipedia login <server-url> --token <TOKEN>\n  \
          recipedia publish <dir-or-file>...\n  \
-         recipedia status [--state missing|outdated|built|ahead]"
+         recipedia unpublish <filename>\n  \
+         recipedia status [--state missing|outdated|built|ahead]\n\n\
+         A build log is attached automatically when a sibling\n\
+         `<archive>.log` file exists next to a published archive."
     );
 }
 
@@ -189,9 +193,52 @@ fn publish(args: Vec<String>) -> Result<()> {
             size as f64 / 1048576.0,
             receipt["state"].as_str().unwrap_or("?"),
         );
+        attach_build_log(&cfg, file, filename);
         uploaded += 1;
     }
     println!("{uploaded} uploaded, {uptodate} up-to-date, {} total", files.len());
+    Ok(())
+}
+
+/// Upload the sibling `<archive>.log` when present — sage build output lands
+/// next to the archive, and the hub shows it on the package page. Best-effort:
+/// a failed log upload never fails the publish that already succeeded.
+fn attach_build_log(cfg: &ClientConfig, archive: &Path, filename: &str) {
+    let log_path = PathBuf::from(format!("{}.log", archive.display()));
+    let Ok(content) = std::fs::read(&log_path) else {
+        return;
+    };
+    if content.len() > 1024 * 1024 {
+        println!("  · build log skipped ({} exceeds 1 MiB)", log_path.display());
+        return;
+    }
+    match ureq::post(format!("{}/api/repo/publish/{filename}/log", cfg.url).as_str())
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .set("Content-Type", "text/plain; charset=utf-8")
+        .send(&content[..])
+    {
+        Ok(_) => println!("  · build log attached ({} bytes)", content.len()),
+        Err(e) => println!("  · build log upload failed: {e}"),
+    }
+}
+
+fn unpublish(args: Vec<String>) -> Result<()> {
+    let cfg = ClientConfig::load()?;
+    let (positional, _) = parse_args(&args);
+    let Some(filename) = positional.first() else {
+        bail!("usage: recipedia unpublish <filename>");
+    };
+    match ureq::delete(format!("{}/api/repo/publish/{filename}", cfg.url).as_str())
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
+        Ok(_) => println!("- {filename} withdrawn"),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            bail!("server refused ({code}): {body}");
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 

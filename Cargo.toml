@@ -2,7 +2,9 @@
 name = "recipedia"
 version = "0.1.0"
 edition = "2021"
-description = "ShenChen Linux recipe & repository hub"
+description = "sclinux recipe & repository hub"
+license = "BSD-2-Clause"
+repository = "https://github.com/sclinuxdev/recipedia"
 
 [dependencies]
 anyhow = "1"

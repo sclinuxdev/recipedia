@@ -65,6 +65,21 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS published_files (
+  filename TEXT NOT NULL,
+  path     TEXT NOT NULL,
+  type     TEXT NOT NULL,
+  size     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_published_files ON published_files(filename);
+
+CREATE TABLE IF NOT EXISTS build_logs (
+  filename    TEXT PRIMARY KEY,
+  content     TEXT NOT NULL,
+  builder     TEXT NOT NULL,
+  uploaded_at INTEGER NOT NULL
+);
 "#;
 
 pub fn open(db_path: &Path) -> Result<Connection> {
@@ -81,7 +96,7 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PackageRow {
     pub name: String,
     pub category: String,
@@ -170,28 +185,77 @@ pub struct RecipeRecord {
     pub recipe_path: String,
 }
 
-pub fn all_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, category, version, release, description, license, channel,
-                provides, dependencies, build_deps, conffiles, source_url, source_sha256,
-                recipe_path
-         FROM packages ORDER BY name",
-    )?;
-    let rows = stmt
-        .query_map([], map_package_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+const PACKAGE_COLS: &str =
+    "name, category, version, release, description, license, channel,
+     provides, dependencies, build_deps, conffiles, source_url, source_sha256, recipe_path";
+
+fn select_packages(conn: &Connection, where_clause: &str, name: Option<&str>) -> Result<Vec<PackageRow>> {
+    let sql = format!("SELECT {PACKAGE_COLS} FROM packages {where_clause}");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match name {
+        Some(n) => stmt.query_map(params![n], map_package_row)?,
+        None => stmt.query_map([], map_package_row)?,
+    }
+    .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
+/// Every recipe version of every package, including superseded ones.
+pub fn all_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
+    select_packages(conn, "ORDER BY name", None)
+}
+
+/// One row per package: its newest recipe version. Lists, the status board
+/// and the dependency graph all speak this dialect; detail pages can still
+/// descend into [`package_versions`].
+pub fn latest_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
+    let mut rows = all_packages(conn)?;
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows.dedup_by(|a, b| {
+        if a.name == b.name {
+            // `a` precedes `b`; keep whichever sorts newer under the same
+            // segment ordering the build-state diff uses.
+            if status_cmp(a, b) == std::cmp::Ordering::Greater {
+                std::mem::swap(a, b);
+            }
+            true
+        } else {
+            false
+        }
+    });
+    Ok(rows)
+}
+
+fn status_cmp(a: &PackageRow, b: &PackageRow) -> std::cmp::Ordering {
+    crate::status::compare_versions(
+        &format!("{}-{}", a.version, a.release),
+        &format!("{}-{}", b.version, b.release),
+    )
+}
+
+/// All recipe versions kept for one package, newest first.
+pub fn package_versions(conn: &Connection, name: &str) -> Result<Vec<PackageRow>> {
+    let mut rows = select_packages(conn, "WHERE name = ?1", Some(name))?;
+    rows.sort_by(|a, b| status_cmp(b, a));
+    Ok(rows)
+}
+
+/// Newest recipe version of one package, if the name exists at all.
 pub fn package_by_name(conn: &Connection, name: &str) -> Result<Option<PackageRow>> {
+    Ok(package_versions(conn, name)?.into_iter().next())
+}
+
+/// Packages (deduplicated) whose `provides` covers `virtual_name` -- the
+/// resolution for names like `virtual/libc` that have no recipe of their own.
+pub fn providers(conn: &Connection, virtual_name: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT name, category, version, release, description, license, channel,
-                provides, dependencies, build_deps, conffiles, source_url, source_sha256,
-                recipe_path
-         FROM packages WHERE name = ?1",
+        "SELECT DISTINCT name FROM packages
+         WHERE EXISTS (SELECT 1 FROM json_each(packages.provides) j WHERE j.value = ?1)",
     )?;
-    let mut rows = stmt.query_map(params![name], map_package_row)?;
-    Ok(rows.next().transpose()?)
+    let rows = stmt
+        .query_map(params![virtual_name], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Packages whose runtime dependencies request `name` (exact dep-name match;
@@ -215,8 +279,9 @@ pub struct CategoryCount {
 }
 
 pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
+    // Distinct names: superseded recipe versions must not inflate counts.
     let mut stmt = conn.prepare(
-        "SELECT category, COUNT(*) FROM packages GROUP BY category ORDER BY category",
+        "SELECT category, COUNT(DISTINCT name) FROM packages GROUP BY category ORDER BY category",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -229,14 +294,15 @@ pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
     Ok(rows)
 }
 
-/// Latest published row per package name (idempotent re-uploads keep one row
-/// per filename, but a name may have several filenames across rebuilds).
-pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {    let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
-         FROM published p
-         WHERE uploaded_at = (SELECT MAX(uploaded_at) FROM published q WHERE q.name = p.name)",
+/// Latest published row per package name -- latest by *version* (an old
+/// build re-uploaded later must not shadow the current one), ties broken by
+/// upload time. One row per filename survives idempotent re-uploads, so a
+/// name may carry several; this folds them to the representative one.
+pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at FROM published",
     )?;
-    let rows = stmt
+    let all = stmt
         .query_map([], |r| {
             Ok(PublishedRow {
                 filename: r.get(0)?,
@@ -250,7 +316,63 @@ pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> 
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut best: std::collections::HashMap<String, PublishedRow> =
+        std::collections::HashMap::new();
+    for row in all {
+        match best.get_mut(&row.name) {
+            Some(cur) => {
+                let newer = crate::status::compare_versions(
+                    &format!("{}-{}", row.version, row.release),
+                    &format!("{}-{}", cur.version, cur.release),
+                );
+                if newer == std::cmp::Ordering::Greater
+                    || (newer == std::cmp::Ordering::Equal && row.uploaded_at > cur.uploaded_at)
+                {
+                    *cur = row;
+                }
+            }
+            None => {
+                best.insert(row.name.clone(), row);
+            }
+        }
+    }
+    let mut rows: Vec<PublishedRow> = best.into_values().collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(rows)
+}
+
+/// Every published build of one package, newest first -- the detail page's
+/// version ladder of what actually landed in the repository.
+pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<PublishedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
+         FROM published WHERE name = ?1 ORDER BY uploaded_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![name], |r| {
+            Ok(PublishedRow {
+                filename: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                release: r.get(3)?,
+                arch: r.get(4)?,
+                size: r.get(5)?,
+                sha256: r.get(6)?,
+                uploaded_at: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Stored manifest meta for one archive (empty JSON → None).
+pub fn published_meta(conn: &Connection, filename: &str) -> Result<Option<crate::repo::ManifestMeta>> {
+    let mut stmt = conn.prepare("SELECT meta FROM published WHERE filename = ?1")?;
+    let mut rows = stmt.query_map(params![filename], |r| r.get::<_, String>(0))?;
+    match rows.next().transpose()? {
+        Some(json) if !json.is_empty() => Ok(serde_json::from_str(&json).ok()),
+        _ => Ok(None),
+    }
 }
 
 /// Everything the index generator needs, including the JSON manifest meta.
@@ -362,6 +484,82 @@ pub fn token_label(conn: &Connection, presented: &str) -> Result<Option<String>>
     Ok(label)
 }
 
+// ---------------------------------------------------------------------------
+// Published file lists & build logs (P5)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileLine {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub size: i64,
+}
+
+/// Swap the stored file list for one archive; called on every publish.
+pub fn replace_published_files(conn: &Connection, filename: &str, lines: &[FileLine]) -> Result<()> {
+    conn.execute("DELETE FROM published_files WHERE filename = ?1", params![filename])?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO published_files (filename, path, type, size) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for l in lines {
+        stmt.execute(params![filename, l.path, l.kind, l.size])?;
+    }
+    Ok(())
+}
+
+pub fn file_list(conn: &Connection, filename: &str) -> Result<Vec<FileLine>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, type, size FROM published_files
+         WHERE filename = ?1 ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map(params![filename], |r| {
+            Ok(FileLine { path: r.get(0)?, kind: r.get(1)?, size: r.get(2)? })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn log_upsert(conn: &Connection, filename: &str, content: &str, builder: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO build_logs (filename, content, builder, uploaded_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(filename) DO UPDATE SET
+             content = excluded.content, builder = excluded.builder,
+             uploaded_at = excluded.uploaded_at",
+        params![filename, content, builder, now()],
+    )?;
+    Ok(())
+}
+
+pub struct LogRow {
+    pub content: String,
+    pub builder: String,
+    pub uploaded_at: i64,
+}
+
+pub fn log_get(conn: &Connection, filename: &str) -> Result<Option<LogRow>> {
+    let mut stmt =
+        conn.prepare("SELECT content, builder, uploaded_at FROM build_logs WHERE filename = ?1")?;
+    let mut rows = stmt.query_map(params![filename], |r| {
+        Ok(LogRow { content: r.get(0)?, builder: r.get(1)?, uploaded_at: r.get(2)? })
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Remove a published artifact everywhere: row, file list, build log.
+/// Returns false when the filename was never published. The on-disk file and
+/// index regeneration are the caller's job (they own repo_dir).
+pub fn delete_published(conn: &Connection, filename: &str) -> Result<bool> {
+    let affected = conn.execute("DELETE FROM published WHERE filename = ?1", params![filename])?;
+    if affected == 0 {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM published_files WHERE filename = ?1", params![filename])?;
+    conn.execute("DELETE FROM build_logs WHERE filename = ?1", params![filename])?;
+    Ok(true)
+}
+
 pub fn recent_syncs(conn: &Connection, limit: i64) -> Result<Vec<SyncEntry>> {
     let mut stmt = conn.prepare(
         "SELECT kind, sha, started_at, ok, message
@@ -388,6 +586,48 @@ pub struct SyncEntry {
     pub started_at: i64,
     pub ok: bool,
     pub message: String,
+}
+
+impl SyncEntry {
+    /// Renderable UTC timestamp ("YYYY-MM-DD HH:MM") for templates.
+    pub fn when(&self) -> String {
+        time_hm_pub(self.started_at)
+    }
+}
+
+impl PublishedRow {
+    /// When this build landed in the repository (template helper).
+    pub fn built_at(&self) -> String {
+        time_hm_pub(self.uploaded_at)
+    }
+    /// Archive size in MiB, one decimal (template helper).
+    pub fn size_mib(&self) -> String {
+        format!("{:.1}", self.size as f64 / 1_048_576.0)
+    }
+}
+
+/// Unix seconds → `YYYY-MM-DD HH:MM:SSZ` UTC via civil-from-days
+/// (no chrono dependency); the single source of wall-clock rendering.
+pub fn time_utc(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// "YYYY-MM-DD HH:MM" — the human-facing slice of [`time_utc`].
+pub fn time_hm_pub(unix: i64) -> String {
+    time_utc(unix).replacen('T', " ", 1)[..16].to_string()
 }
 
 pub fn log_sync(

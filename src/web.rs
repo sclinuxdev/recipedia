@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::{self, PackageRow, PublishedRow, SyncEntry};
+use crate::graph;
 use crate::repo;
 use crate::status::{derive, State as BuildState};
 use crate::sync;
@@ -33,21 +34,37 @@ pub struct AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// Build logs are plain text and only need to scroll back through a failed
+/// phase; anything bigger is a mistake (the archive itself is the artifact).
+const MAX_LOG_BYTES: usize = 1024 * 1024;
+/// Detail pages show a capped file listing so llvm-sized payloads stay sane.
+const DETAIL_FILES_SHOWN: usize = 400;
+
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/packages", get(packages))
-        .route("/package/{name}", get(package_detail))
+        // Catch-all: provided names carry a slash (`virtual/libc`) and must
+        // resolve to their provider page like any recipe name.
+        .route("/package/{*name}", get(package_detail))
         .route("/category/{cat}", get(category))
         .route("/status", get(status_page))
+        .route("/graph", get(graph_page))
         .route("/upload", get(upload_page))
         .route("/api/packages", get(api_packages))
-        .route("/api/package/{name}", get(api_package))
+        .route("/api/package/{*name}", get(api_package))
         .route("/api/status", get(api_status))
+        .route("/api/graph", get(api_graph))
         .route("/api/webhook/github", post(github_webhook))
         .route(
             "/api/repo/publish/{filename}",
-            post(publish).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            post(publish)
+                .delete(unpublish_file)
+                .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/repo/publish/{filename}/log",
+            post(upload_log).layer(DefaultBodyLimit::max(MAX_LOG_BYTES)),
         )
         .route("/repo/{*path}", get(repo_file))
         .with_state(state)
@@ -67,11 +84,24 @@ pub struct PackageView {
     pub state: BuildState,
     /// Repo-side `version-release` when a build exists (`""` otherwise).
     pub repo_version: String,
+    /// When that build landed (unix seconds; 0 when nothing published).
+    pub built_at: i64,
+}
+
+impl PackageView {
+    /// Renderable build time for list pages (empty when nothing published).
+    pub fn built_time(&self) -> String {
+        if self.built_at > 0 { db::time_hm_pub(self.built_at) } else { String::new() }
+    }
+    /// True when the repository carries a different version than the recipe.
+    pub fn repo_differs(&self) -> bool {
+        !self.repo_version.is_empty() && self.repo_version != format!("{}-{}", self.version, self.release)
+    }
 }
 
 fn package_views(conn: &Connection, filter: impl Fn(&PackageRow) -> bool) -> Result<Vec<PackageView>> {
     let published = published_index(conn)?;
-    let rows = db::all_packages(conn)?;
+    let rows = db::latest_packages(conn)?;
     Ok(rows
         .iter()
         .filter(|r| filter(r))
@@ -91,6 +121,7 @@ fn package_views(conn: &Connection, filter: impl Fn(&PackageRow) -> bool) -> Res
                 repo_version: published
                     .map(|p| format!("{}-{}", p.version, p.release))
                     .unwrap_or_default(),
+                built_at: published.map(|p| p.uploaded_at).unwrap_or(0),
             }
         })
         .collect())
@@ -176,15 +207,33 @@ async fn packages(
     })
 }
 
+/// One entry of the detail page's recipe-version ladder.
+#[derive(Debug, Clone)]
+pub struct VersionEntry {
+    pub version: String,
+    pub release: String,
+    pub github_url: String,
+    pub latest: bool,
+}
+
 #[derive(Template)]
 #[template(path = "package_detail.html")]
 pub struct DetailTemplate {
     pub pkg: PackageRow,
     pub state: BuildState,
-    pub published: Option<PublishedRow>,
+    /// Every published build of this package, newest upload first.
+    pub published: Vec<PublishedRow>,
+    /// Every recipe version kept in the tree, newest first (index 0 is shown
+    /// as the headline).
+    pub versions: Vec<VersionEntry>,
     pub reverse: Vec<String>,
     pub recipe_toml: String,
     pub github_url: String,
+    pub files: Vec<db::FileLine>,
+    pub files_total: usize,
+    pub has_log: bool,
+    pub log_content: String,
+    pub log_builder: String,
 }
 
 async fn package_detail(
@@ -192,22 +241,125 @@ async fn package_detail(
     AxPath(name): AxPath<String>,
 ) -> Response {
     with_conn(&state, |conn| {
-        let Some(pkg) = db::package_by_name(conn, &name)? else {
-            return Ok(StatusCode::NOT_FOUND.into_response());
+        let versions = db::package_versions(conn, &name)?;
+        let published = db::published_for_name(conn, &name)?;
+        let pkg = match versions.first().cloned() {
+            Some(pkg) => pkg,
+            None => {
+                // Not a recipe name -- but a provided one (`virtual/libc`,
+                // `cc`, ...): list the providers instead of dead-ending.
+                let provider_names = db::providers(conn, &name)?;
+                if !provider_names.is_empty() {
+                    return render_virtual(conn, &name, &provider_names);
+                }
+                // Published but recipeless (recipe removed / pre-tree build):
+                // describe it from its own manifest meta.
+                match published.first() {
+                    Some(row) => orphan_row(conn, row)?,
+                    None => return Ok(StatusCode::NOT_FOUND.into_response()),
+                }
+            }
         };
-        let published_idx = published_index(conn)?;
-        let published = published_idx.get(&name).cloned();
+        // State compares against the newest *version* on the repo side, not
+        // merely the most recent upload (an old rebuild must not flip it).
+        let best_pub = published.iter().max_by(|a, b| {
+            crate::status::compare_versions(
+                &format!("{}-{}", a.version, a.release),
+                &format!("{}-{}", b.version, b.release),
+            )
+            .then(a.uploaded_at.cmp(&b.uploaded_at))
+        });
         let st = derive(
             &pkg.version,
             &pkg.release,
-            published.as_ref().map(|p| (p.version.as_str(), p.release.as_str())),
+            best_pub.map(|p| (p.version.as_str(), p.release.as_str())),
         );
+        let ladder = versions
+            .iter()
+            .enumerate()
+            .map(|(i, v)| VersionEntry {
+                version: v.version.clone(),
+                release: v.release.clone(),
+                github_url: github_blob_url(&state.config.git_url, &v.recipe_path),
+                latest: i == 0,
+            })
+            .collect();
+        // Files and log come from the representative archive.
+        let (files, files_total, log) = match best_pub {
+            Some(row) => {
+                let all = db::file_list(conn, &row.filename)?;
+                let total = all.len();
+                (all.into_iter().take(DETAIL_FILES_SHOWN).collect(), total, db::log_get(conn, &row.filename)?)
+            }
+            None => (Vec::new(), 0, None),
+        };
         let recipe_toml = std::fs::read_to_string(state.config.git_dir().join(&pkg.recipe_path))
             .unwrap_or_else(|_| "<recipe not on disk>".to_string());
         let github_url = github_blob_url(&state.config.git_url, &pkg.recipe_path);
         let reverse = db::reverse_deps(conn, &name)?;
-        let tpl = DetailTemplate { pkg, state: st, published, reverse, recipe_toml, github_url };
+        let tpl = DetailTemplate {
+            state: st,
+            published,
+            versions: ladder,
+            files,
+            files_total,
+            has_log: log.is_some(),
+            log_content: log.as_ref().map(|l| l.content.clone()).unwrap_or_default(),
+            log_builder: log.as_ref().map(|l| l.builder.clone()).unwrap_or_default(),
+            pkg,
+            reverse,
+            recipe_toml,
+            github_url,
+        };
         Ok(Html(tpl.render()?).into_response())
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderView {
+    pub name: String,
+    pub state: BuildState,
+    pub repo_version: String,
+}
+
+/// A name that exists only as someone's `provides` entry (`virtual/libc`,
+/// `cc`): no recipe of its own, so the page resolves it to its providers.
+#[derive(Template)]
+#[template(path = "virtual.html")]
+pub struct VirtualTemplate {
+    pub name: String,
+    pub providers: Vec<ProviderView>,
+}
+
+fn render_virtual(conn: &Connection, name: &str, provider_names: &[String]) -> Result<Response> {
+    let wanted: std::collections::HashSet<&str> =
+        provider_names.iter().map(String::as_str).collect();
+    let providers = package_views(conn, |r| wanted.contains(r.name.as_str()))?
+        .into_iter()
+        .map(|v| ProviderView { name: v.name, state: v.state, repo_version: v.repo_version })
+        .collect();
+    Ok(Html(VirtualTemplate { name: name.to_string(), providers }.render()?).into_response())
+}
+
+/// A pseudo-recipe row for a package that exists only in the repository:
+/// identity and metadata come from its manifest, dependency fields stay empty.
+fn orphan_row(conn: &Connection, row: &PublishedRow) -> Result<PackageRow> {
+    let meta = db::published_meta(conn, &row.filename)?;
+    Ok(PackageRow {
+        name: row.name.clone(),
+        category: "orphan".into(),
+        version: meta.as_ref().map(|m| m.version.clone()).unwrap_or_else(|| row.version.clone()),
+        release: meta.as_ref().map(|m| m.release.clone()).unwrap_or_else(|| row.release.clone()),
+        description: meta.as_ref().map(|m| m.description.clone()).unwrap_or_default(),
+        license: meta.as_ref().map(|m| m.license.clone()).unwrap_or_default(),
+        channel: meta.as_ref().map(|m| m.channel.clone()).unwrap_or_default(),
+        provides: meta.as_ref().map(|m| m.provides.clone()).unwrap_or_default(),
+        dependencies: Vec::new(),
+        build_dependencies: Vec::new(),
+        conffiles: meta.as_ref().map(|m| m.conffiles.clone()).unwrap_or_default(),
+        source_url: String::new(),
+        source_sha256: String::new(),
+        recipe_path: String::new(),
     })
 }
 
@@ -265,6 +417,61 @@ pub struct UploadTemplate;
 
 async fn upload_page() -> Response {
     Html(UploadTemplate.render().expect("static template")).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Dependency graph
+// ---------------------------------------------------------------------------
+
+/// Layered layout over the latest-recipe dependency edges; node color carries
+/// the derived build state.
+fn compute_graph(conn: &Connection) -> Result<(graph::Graph, usize)> {
+    let rows = db::latest_packages(conn)?;
+    let published: HashMap<String, (String, String)> = db::published_latest_by_name(conn)?
+        .into_iter()
+        .map(|p| (p.name, (p.version, p.release)))
+        .collect();
+    let total = rows.len();
+    Ok((graph::build(&rows, &published), total))
+}
+
+#[derive(Template)]
+#[template(path = "graph.html")]
+pub struct GraphTemplate {
+    pub svg: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+async fn graph_page(State(state): State<SharedState>) -> Response {
+    with_conn(&state, |conn| {
+        let (g, total) = compute_graph(conn)?;
+        let tpl = GraphTemplate { svg: g.render_svg(), node_count: total, edge_count: g.edges.len() };
+        Ok(Html(tpl.render()?).into_response())
+    })
+}
+
+async fn api_graph(State(state): State<SharedState>) -> Response {
+    with_conn(&state, |conn| {
+        let (g, _) = compute_graph(conn)?;
+        let nodes: Vec<serde_json::Value> = g
+            .nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "name": n.name, "level": n.level, "state": n.state.label(),
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = g
+            .edges
+            .iter()
+            .map(|&(a, b)| serde_json::json!([g.nodes[a].name, g.nodes[b].name]))
+            .collect();
+        Ok(json_response(&serde_json::json!({
+            "width": g.width, "height": g.height, "nodes": nodes, "edges": edges,
+        })))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +572,89 @@ async fn publish(
     }
 }
 
+/// Withdraw a published artifact (token required): DB rows, build log, file,
+/// re-index. The repository stays a curated space, not an append-only dump.
+async fn unpublish_file(
+    State(state): State<SharedState>,
+    AxPath(filename): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let builder = match authorize(&state, &headers) {
+        Ok(label) => label,
+        Err(resp) => return *resp,
+    };
+    if !repo::valid_filename(&filename) {
+        return (StatusCode::BAD_REQUEST, "invalid package filename").into_response();
+    }
+    let exists = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        db::published_sha256(&conn, &filename)
+    };
+    match exists {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, format!("{filename} is not published")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {e:#}")).into_response(),
+    }
+    let config = state.config.clone();
+    let target = filename.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.db.lock().expect("unpublish worker: db mutex poisoned");
+        repo::unpublish(&conn, &config, &target)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => json_response(&serde_json::json!({"deleted": filename, "by": builder})),
+        Ok(Err(e)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("unpublish failed: {e:#}"),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")).into_response(),
+    }
+}
+
+/// Attach/replace a plain-text build log for a published archive. The CLI
+/// uploads `<archive>.log` siblings automatically after a successful publish.
+async fn upload_log(
+    State(state): State<SharedState>,
+    AxPath(filename): AxPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let builder = match authorize(&state, &headers) {
+        Ok(label) => label,
+        Err(resp) => return *resp,
+    };
+    if !repo::valid_filename(&filename) {
+        return (StatusCode::BAD_REQUEST, "invalid package filename").into_response();
+    }
+    if body.len() > MAX_LOG_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "log exceeds 1 MiB").into_response();
+    }
+    let content = match std::str::from_utf8(&body) {
+        Ok(text) => text,
+        Err(_) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "log must be UTF-8 text").into_response(),
+    };
+    let target = filename.clone();
+    let result: Result<usize> = (|| {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        // Only logs for things actually published: no orphans, no squatting.
+        match db::published_sha256(&conn, &target)? {
+            Some(_) => db::log_upsert(&conn, &target, content.trim_end(), &builder).map(|_| body.len()),
+            None => anyhow::bail!("{target} is not published"),
+        }
+    })();
+    match result {
+        Ok(len) => json_response(&serde_json::json!({"stored": len, "filename": filename})),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("log upload rejected: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+
 /// Static delivery of published packages and index.toml. ETag carries the
 /// stored sha256 so clients can skip re-uploads of unchanged files.
 async fn repo_file(
@@ -444,7 +734,14 @@ async fn api_packages(State(app): State<SharedState>) -> Response {
 async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<String>) -> Response {
     with_conn(&state, |conn| {
         let Some(pkg) = db::package_by_name(conn, &name)? else {
-            return Ok(StatusCode::NOT_FOUND.into_response());
+            // Resolve provided names (`virtual/libc`, `cc`, ...) to providers.
+            let provider_names = db::providers(conn, &name)?;
+            if provider_names.is_empty() {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
+            return Ok(json_response(&serde_json::json!({
+                "name": name, "virtual": true, "providers": provider_names,
+            })));
         };
         let published_idx = published_index(conn)?;
         let published = published_idx.get(&name);
@@ -460,7 +757,11 @@ async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<Stri
             repo_version: published.map(|p| p.version.clone()),
             repo_release: published.map(|p| p.release.clone()),
         };
-        let body = serde_json::to_string(&(pkg, entry))?;
+        let versions: Vec<serde_json::Value> = db::package_versions(conn, &name)?
+            .iter()
+            .map(|v| serde_json::json!({"version": v.version, "release": v.release, "recipe_path": v.recipe_path}))
+            .collect();
+        let body = serde_json::to_string(&(pkg, entry, versions))?;
         Ok(([("content-type", "application/json")], body).into_response())
     })
 }
