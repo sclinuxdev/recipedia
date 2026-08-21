@@ -341,6 +341,29 @@ pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> 
     Ok(rows)
 }
 
+/// Every published archive, newest upload first -- the repo file browser.
+pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
+         FROM published ORDER BY uploaded_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(PublishedRow {
+                filename: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                release: r.get(3)?,
+                arch: r.get(4)?,
+                size: r.get(5)?,
+                sha256: r.get(6)?,
+                uploaded_at: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Every published build of one package, newest first -- the detail page's
 /// version ladder of what actually landed in the repository.
 pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<PublishedRow>> {

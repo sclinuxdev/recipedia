@@ -66,6 +66,8 @@ pub fn router(state: SharedState) -> Router {
             "/api/repo/publish/{filename}/log",
             post(upload_log).layer(DefaultBodyLimit::max(MAX_LOG_BYTES)),
         )
+        .route("/repo", get(repo_index))
+        .route("/repo/", get(repo_index))
         .route("/repo/{*path}", get(repo_file))
         .with_state(state)
 }
@@ -665,6 +667,27 @@ async fn upload_log(
 
 /// Static delivery of published packages and index.toml. ETag carries the
 /// stored sha256 so clients can skip re-uploads of unchanged files.
+#[derive(Template)]
+#[template(path = "repo_index.html")]
+pub struct RepoIndexTemplate {
+    pub files: Vec<PublishedRow>,
+    pub total_mib: String,
+}
+
+/// Browsable listing of everything published: this is what
+/// `https://repo.<host>/` renders (and `/repo/` on the main site).
+async fn repo_index(State(state): State<SharedState>) -> Response {
+    with_conn(&state, |conn| {
+        let files = db::published_all(conn)?;
+        let bytes: i64 = files.iter().map(|f| f.size).sum();
+        let tpl = RepoIndexTemplate {
+            total_mib: format!("{:.1}", bytes as f64 / 1_048_576.0),
+            files,
+        };
+        Ok(Html(tpl.render()?).into_response())
+    })
+}
+
 async fn repo_file(
     State(state): State<SharedState>,
     AxPath(path): AxPath<String>,
