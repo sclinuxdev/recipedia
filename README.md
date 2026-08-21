@@ -41,7 +41,18 @@ recipedia status --state missing
 
 Configuration is environment-only: `RECIPEEDIA_LISTEN`, `RECIPEEDIA_DB`,
 `RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URL`, `RECIPEEDIA_WEBHOOK_SECRET`,
-`RECIPEEDIA_POLL_SECS`.
+`RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_REPO_URL` (public repo domain for
+frontend file links; unset keeps same-origin `/repo/...`).
+
+## Deploying (Docker / 1Panel)
+
+The repo ships a `Dockerfile` (multi-stage musl build, runtime image is
+alpine + git only) and a `compose.yaml`. On a 1Panel box: 容器 → 编排 →
+创建编排, paste `compose.yaml` as-is — it builds from this GitHub repo,
+binds `127.0.0.1:8300` on the host and keeps all state in the compose
+directory's `data/`. Then 网站 → 创建网站 → 反向代理 to `127.0.0.1:8300`
+for public HTTPS. Mint publish tokens with
+`docker exec recipedia recipedia-server token <label>`.
 
 ## Build
 

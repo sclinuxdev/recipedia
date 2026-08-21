@@ -15,6 +15,9 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     /// Fallback poll interval in seconds (webhook is the fast path).
     pub poll_secs: u64,
+    /// Public base URL the frontend links repo files at (e.g.
+    /// `https://repo.example.com`); empty keeps same-origin `/repo/...`.
+    pub repo_base: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -35,6 +38,7 @@ impl Config {
             git_url: env_or("RECIPEEDIA_GIT_URL", "https://github.com/sclinuxdev/recipes"),
             webhook_secret: std::env::var("RECIPEEDIA_WEBHOOK_SECRET").ok(),
             poll_secs: env_or("RECIPEEDIA_POLL_SECS", "600").parse().unwrap_or(600),
+            repo_base: env_or("RECIPEEDIA_REPO_URL", "").trim_end_matches('/').to_string(),
         }
     }
 

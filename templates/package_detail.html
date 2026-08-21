@@ -26,7 +26,7 @@
   {% for p in published %}
   <tr>
     <td class="mono">{{ p.version }}-{{ p.release }}</td>
-    <td class="mono"><a href="/repo/{{ p.filename }}">{{ p.filename }}</a></td>
+    <td class="mono"><a href="{{ repo_prefix }}/{{ p.filename }}">{{ p.filename }}</a></td>
     <td class="mono muted">{{ p.size_mib() }} MiB</td>
     <td class="mono muted">{{ p.built_at() }}</td>
   </tr>

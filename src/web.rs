@@ -234,6 +234,9 @@ pub struct DetailTemplate {
     pub has_log: bool,
     pub log_content: String,
     pub log_builder: String,
+    /// Base for archive links: the public repo domain when configured,
+    /// same-origin `/repo` otherwise.
+    pub repo_prefix: String,
 }
 
 async fn package_detail(
@@ -310,6 +313,11 @@ async fn package_detail(
             reverse,
             recipe_toml,
             github_url,
+            repo_prefix: if state.config.repo_base.is_empty() {
+                "/repo".to_string()
+            } else {
+                state.config.repo_base.clone()
+            },
         };
         Ok(Html(tpl.render()?).into_response())
     })
