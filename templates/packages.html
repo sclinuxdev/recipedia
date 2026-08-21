@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{% if !category.is_empty() %}Category {{ category }}{% else %}Packages{% endif %}{% endblock %}
+{% block content %}
+<h1>{% if !category.is_empty() %}Category: {{ category }}{% else %}Packages{% endif %} <span class="muted">({{ total }})</span></h1>
+
+{% if category.is_empty() %}
+<form class="filters" method="get" action="/packages">
+  <input type="search" name="q" placeholder="Search name or description" value="{{ q }}">
+  <select name="category">
+    <option value="">all categories</option>
+    <option value="system">system</option>
+    <option value="devel">devel</option>
+    <option value="lib">lib</option>
+    <option value="net">net</option>
+    <option value="security">security</option>
+    <option value="media">media</option>
+    <option value="text">text</option>
+    <option value="utils">utils</option>
+    <option value="other">other</option>
+    <option value="misc">misc</option>
+  </select>
+  <select name="state">
+    <option value="">any state</option>
+    <option value="missing">missing</option>
+    <option value="outdated">outdated</option>
+    <option value="built">built</option>
+    <option value="ahead">ahead</option>
+  </select>
+  <button type="submit">Filter</button>
+</form>
+{% endif %}
+
+<table>
+  <tr><th>Name</th><th>Version</th><th>Category</th><th>State</th><th>Description</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono">{{ r.version }}-{{ r.release }}</td>
+    <td><a href="/category/{{ r.category }}">{{ r.category }}</a></td>
+    <td><span class="badge st-{{ r.state.label() }}">{{ r.state.label() }}</span></td>
+    <td class="muted">{{ r.description }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

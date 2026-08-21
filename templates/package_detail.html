@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}{{ pkg.name }}{% endblock %}
+{% block content %}
+<h1><span class="mono">{{ pkg.name }}</span> <span class="mono muted">{{ pkg.version }}-{{ pkg.release }}</span>
+    <span class="badge st-{{ state.label() }}">{{ state.label() }}</span></h1>
+
+<p>{{ pkg.description }}</p>
+
+<h2>Details</h2>
+<table>
+  <tr><th>Recipe version</th><td class="mono">{{ pkg.version }}-{{ pkg.release }}</td></tr>
+  {% match published %}
+  {% when Some(p) %}
+  <tr><th>Repo version</th><td class="mono">{{ p.version }}-{{ p.release }}
+      <span class="muted">({{ p.filename }})</span></td></tr>
+  {% when None %}
+  {% endmatch %}
+  <tr><th>Category</th><td><a href="/category/{{ pkg.category }}">{{ pkg.category }}</a></td></tr>
+  <tr><th>Channel</th><td class="mono">{{ pkg.channel }}</td></tr>
+  <tr><th>License</th><td>{{ pkg.license }}</td></tr>
+  <tr><th>Source</th><td class="mono">{{ pkg.source_url }}</td></tr>
+  {% if !pkg.source_sha256.is_empty() %}
+  <tr><th>Source sha256</th><td class="mono">{{ pkg.source_sha256 }}</td></tr>
+  {% endif %}
+  <tr><th>Recipe</th><td class="mono"><a href="{{ github_url }}">{{ pkg.recipe_path }}</a></td></tr>
+</table>
+
+<h2>Dependencies</h2>
+<table>
+  <tr><th>Package</th><th>Constraint</th></tr>
+  {% for d in pkg.dependencies %}
+  <tr><td class="mono"><a href="/package/{{ d.name }}">{{ d.name }}</a></td><td class="mono">{{ d.req }}</td></tr>
+  {% endfor %}
+</table>
+
+{% if !pkg.build_dependencies.is_empty() %}
+<h2>Build dependencies</h2>
+<table>
+  <tr><th>Package</th><th>Constraint</th></tr>
+  {% for d in pkg.build_dependencies %}
+  <tr><td class="mono"><a href="/package/{{ d.name }}">{{ d.name }}</a></td><td class="mono">{{ d.req }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if !reverse.is_empty() %}
+<h2>Required by</h2>
+<p>{% for r in reverse %}<a class="mono" href="/package/{{ r }}">{{ r }}</a>{{ " " }}{% endfor %}</p>
+{% endif %}
+
+{% if !pkg.provides.is_empty() %}
+<h2>Provides</h2>
+<p>{% for p in pkg.provides %}<span class="mono">{{ p }}</span>{{ " " }}{% endfor %}</p>
+{% endif %}
+
+{% if !pkg.conffiles.is_empty() %}
+<h2>Conffiles</h2>
+<p>{% for c in pkg.conffiles %}<span class="mono">{{ c }}</span>{{ " " }}{% endfor %}</p>
+{% endif %}
+
+<h2>recipe.toml</h2>
+<pre class="recipe">{{ recipe_toml }}</pre>
+{% endblock %}

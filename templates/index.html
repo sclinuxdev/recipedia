@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<h1>Recipe &amp; Repository Hub</h1>
+
+<div class="stats">
+  <div class="stat"><b>{{ total }}</b><span>recipes</span></div>
+  <div class="stat"><b>{{ built }}</b><span>built</span></div>
+  <div class="stat"><b>{{ missing }}</b><span>missing</span></div>
+  <div class="stat"><b>{{ outdated }}</b><span>outdated</span></div>
+  <div class="stat"><b>{{ ahead }}</b><span>ahead</span></div>
+</div>
+
+<h2>Categories</h2>
+<table>
+  <tr><th>Category</th><th>Packages</th></tr>
+  {% for c in categories %}
+  <tr>
+    <td><a href="/category/{{ c.name }}">{{ c.name }}</a></td>
+    <td>{{ c.count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Recent syncs</h2>
+<table>
+  <tr><th>When</th><th>Trigger</th><th>Commit</th><th>Result</th></tr>
+  {% for s in recent_syncs %}
+  <tr>
+    <td class="mono">{{ s.started_at }}</td>
+    <td>{{ s.trigger }}</td>
+    <td class="mono">{{ s.commit }}</td>
+    <td>{% if s.ok %}ok · {{ s.message }}{% else %}<span class="badge st-ahead">failed</span> · {{ s.message }}{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

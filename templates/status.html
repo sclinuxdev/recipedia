@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Build Status{% endblock %}
+{% block content %}
+<h1>Build Status <span class="muted">({{ built }} built)</span></h1>
+
+<h2>Missing — awaiting first build ({{ missing.len() }})</h2>
+<table>
+  <tr><th>Name</th><th>Version</th><th>Category</th><th>Description</th></tr>
+  {% for r in missing %}
+  <tr>
+    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono">{{ r.version }}-{{ r.release }}</td>
+    <td>{{ r.category }}</td>
+    <td class="muted">{{ r.description }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Outdated — repo behind recipes ({{ outdated.len() }})</h2>
+<table>
+  <tr><th>Name</th><th>Recipe</th><th>In repo</th><th>Description</th></tr>
+  {% for r in outdated %}
+  <tr>
+    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono">{{ r.version }}-{{ r.release }}</td>
+    <td class="mono">{{ r.repo_version }}</td>
+    <td class="muted">{{ r.description }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Ahead — recipe lags the repo, check ({{ ahead.len() }})</h2>
+<table>
+  <tr><th>Name</th><th>Recipe</th><th>Description</th></tr>
+  {% for r in ahead %}
+  <tr>
+    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono">{{ r.version }}-{{ r.release }}</td>
+    <td class="muted">{{ r.description }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
