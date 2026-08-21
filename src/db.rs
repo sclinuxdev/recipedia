@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS published (
   size         INTEGER NOT NULL,
   sha256       TEXT NOT NULL,
   builder      TEXT NOT NULL,
-  uploaded_at  INTEGER NOT NULL
+  uploaded_at  INTEGER NOT NULL,
+  meta         TEXT NOT NULL DEFAULT ''  -- JSON ManifestMeta extracted from the archive
 );
 CREATE INDEX IF NOT EXISTS idx_published_name ON published(name);
 
@@ -75,6 +76,8 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("cannot open database at {}", db_path.display()))?;
     conn.execute_batch(SCHEMA)?;
+    // Databases created before P3 lack the published.meta column.
+    let _ = conn.execute("ALTER TABLE published ADD COLUMN meta TEXT NOT NULL DEFAULT ''", []);
     Ok(conn)
 }
 
@@ -228,8 +231,7 @@ pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
 
 /// Latest published row per package name (idempotent re-uploads keep one row
 /// per filename, but a name may have several filenames across rebuilds).
-pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {
-    let mut stmt = conn.prepare(
+pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {    let mut stmt = conn.prepare(
         "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
          FROM published p
          WHERE uploaded_at = (SELECT MAX(uploaded_at) FROM published q WHERE q.name = p.name)",
@@ -249,6 +251,115 @@ pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> 
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Everything the index generator needs, including the JSON manifest meta.
+pub struct IndexRow {
+    pub filename: String,
+    pub name: String,
+    pub version: String,
+    pub release: String,
+    pub arch: String,
+    pub size: i64,
+    pub meta_json: String,
+}
+
+pub fn index_rows(conn: &Connection) -> Result<Vec<IndexRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT filename, name, version, release, arch, size, meta
+         FROM published ORDER BY name, filename",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(IndexRow {
+                filename: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                release: r.get(3)?,
+                arch: r.get(4)?,
+                size: r.get(5)?,
+                meta_json: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Insert or overwrite one published file. Re-uploading the same filename
+/// replaces the row (and the file on disk) — publish stays idempotent.
+pub fn upsert_published(
+    conn: &Connection,
+    filename: &str,
+    meta: &crate::repo::ManifestMeta,
+    size: i64,
+    sha256: &str,
+    builder: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO published (filename, name, version, release, arch, size, sha256,
+             builder, uploaded_at, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(filename) DO UPDATE SET
+             name = excluded.name, version = excluded.version, release = excluded.release,
+             arch = excluded.arch, size = excluded.size, sha256 = excluded.sha256,
+             builder = excluded.builder, uploaded_at = excluded.uploaded_at,
+             meta = excluded.meta",
+        params![
+            filename,
+            meta.name,
+            meta.version,
+            meta.release,
+            meta.arch,
+            size,
+            sha256,
+            builder,
+            now(),
+            serde_json::to_string(meta).map_err(json_err)?,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn published_sha256(conn: &Connection, filename: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT sha256 FROM published WHERE filename = ?1")?;
+    let mut rows = stmt.query_map(params![filename], |r| r.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+// ---------------------------------------------------------------------------
+// Publish tokens (Bearer auth for /api/repo/publish)
+// ---------------------------------------------------------------------------
+
+/// Mint a fresh token: returned once in full, stored only as SHA-256.
+pub fn token_create(conn: &Connection, label: &str) -> Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    let token = format!("rt_{}", hex::encode(raw));
+    let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+    conn.execute(
+        "INSERT INTO tokens (token_hash, label, created_at) VALUES (?1, ?2, ?3)",
+        params![hash, label, now()],
+    )?;
+    Ok(token)
+}
+
+/// Resolve a presented Bearer token to its label, refreshing last_used_at.
+pub fn token_label(conn: &Connection, presented: &str) -> Result<Option<String>> {
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(presented.as_bytes()));
+    let mut stmt = conn.prepare("SELECT label FROM tokens WHERE token_hash = ?1")?;
+    let mut rows = stmt.query_map(params![hash], |r| r.get::<_, String>(0))?;
+    let label = match rows.next() {
+        Some(row) => Some(row?),
+        None => return Ok(None),
+    };
+    conn.execute(
+        "UPDATE tokens SET last_used_at = ?1 WHERE token_hash = ?2",
+        params![now(), hash],
+    )?;
+    Ok(label)
 }
 
 pub fn recent_syncs(conn: &Connection, limit: i64) -> Result<Vec<SyncEntry>> {

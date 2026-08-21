@@ -4,19 +4,25 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use askama::Template;
-use axum::body::Bytes;
-use axum::extract::{Path as AxPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::{self, PackageRow, PublishedRow, SyncEntry};
+use crate::repo;
 use crate::status::{derive, State as BuildState};
 use crate::sync;
+
+/// Uploads are streamed straight to disk; the ceiling only guards against
+/// runaway requests. Generous because llvm-sized archives are expected.
+const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 pub struct AppState {
     pub db: Mutex<Connection>,
@@ -34,10 +40,16 @@ pub fn router(state: SharedState) -> Router {
         .route("/package/{name}", get(package_detail))
         .route("/category/{cat}", get(category))
         .route("/status", get(status_page))
+        .route("/upload", get(upload_page))
         .route("/api/packages", get(api_packages))
         .route("/api/package/{name}", get(api_package))
         .route("/api/status", get(api_status))
         .route("/api/webhook/github", post(github_webhook))
+        .route(
+            "/api/repo/publish/{filename}",
+            post(publish).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route("/repo/{*path}", get(repo_file))
         .with_state(state)
 }
 
@@ -245,6 +257,167 @@ async fn status_page(State(state): State<SharedState>) -> Response {
         let tpl = StatusTemplate { missing, outdated, ahead, built };
         Ok(Html(tpl.render()?).into_response())
     })
+}
+
+#[derive(Template)]
+#[template(path = "upload.html")]
+pub struct UploadTemplate;
+
+async fn upload_page() -> Response {
+    Html(UploadTemplate.render().expect("static template")).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Publish (Bearer token) & static repository
+// ---------------------------------------------------------------------------
+
+/// Resolve the request's bearer token to a builder label, or produce the 401.
+fn authorize(state: &SharedState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    let Some(token) = presented else {
+        return Err(Box::new((StatusCode::UNAUTHORIZED, "missing bearer token").into_response()));
+    };
+    match db::token_label(&state.db.lock().expect("db mutex poisoned"), token) {
+        Ok(Some(label)) => Ok(label),
+        Ok(None) => Err(Box::new((StatusCode::UNAUTHORIZED, "invalid token").into_response())),
+        Err(e) => Err(Box::new((StatusCode::INTERNAL_SERVER_ERROR, format!("token check failed: {e:#}")).into_response())),
+    }
+}
+
+async fn publish(
+    State(state): State<SharedState>,
+    AxPath(filename): AxPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let builder = match authorize(&state, &headers) {
+        Ok(label) => label,
+        Err(resp) => return *resp,
+    };
+    if !repo::valid_filename(&filename) {
+        return (StatusCode::BAD_REQUEST, "invalid package filename").into_response();
+    }
+    let declared = headers
+        .get("x-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    std::fs::create_dir_all(&state.config.repo_dir).ok();
+    let tmp_path = state
+        .config
+        .repo_dir
+        .join(format!(".incoming-{}-{}", std::process::id(), filename));
+    let mut file = match tokio::fs::File::create(&tmp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot stage upload: {e}"))
+                .into_response()
+        }
+    };
+
+    // Stream body to disk while hashing — archives are far too big to buffer.
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    let mut hasher = sha2::Sha256::new();
+    let mut stream = body.into_data_stream();
+    let mut aborted: Option<String> = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+                if let Err(e) = file.write_all(&bytes).await {
+                    aborted = Some(format!("cannot write upload: {e}"));
+                    break;
+                }
+            }
+            Err(e) => {
+                aborted = Some(format!("upload interrupted: {e}"));
+                break;
+            }
+        }
+    }
+    drop(file);
+    if let Some(msg) = aborted {
+        tokio::fs::remove_file(&tmp_path).await.ok();
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    let sha256 = hex::encode(hasher.finalize());
+    let config = state.config.clone();
+    let ingest_name = filename.clone();
+    let staged = tmp_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.db.lock().expect("publish worker: db mutex poisoned");
+        repo::ingest(&conn, &config, &staged, &ingest_name, &sha256, declared.as_deref(), &builder)
+    })
+    .await;
+    match result {
+        Ok(Ok(receipt)) => json_response(&receipt),
+        Ok(Err(e)) => {
+            tokio::fs::remove_file(&tmp_path).await.ok();
+            (StatusCode::UNPROCESSABLE_ENTITY, format!("publish rejected: {e:#}")).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("publish task panicked: {e}")).into_response(),
+    }
+}
+
+/// Static delivery of published packages and index.toml. ETag carries the
+/// stored sha256 so clients can skip re-uploads of unchanged files.
+async fn repo_file(
+    State(state): State<SharedState>,
+    AxPath(path): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if path.split('/').any(|seg| seg.is_empty() || seg == ".." || seg == ".") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let full = state.config.repo_dir.join(&path);
+    let meta = match tokio::fs::metadata(&full).await {
+        Ok(m) if m.is_file() => m,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let etag = if path == "index.toml" {
+        None // regenerated on every publish; no stable hash worth caching
+    } else {
+        match db::published_sha256(&state.db.lock().expect("db mutex poisoned"), &path) {
+            Ok(Some(sha)) => Some(sha),
+            _ => None,
+        }
+    };
+    if let Some(sha) = &etag {
+        if headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|want| want.trim() == format!("\"{sha}\""))
+        {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [("etag", format!("\"{sha}\""))],
+            )
+                .into_response();
+        }
+    }
+
+    let file = match tokio::fs::File::open(&full).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot open {}: {e}", path))
+                .into_response()
+        }
+    };
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, meta.len());
+    if let Some(sha) = &etag {
+        builder = builder.header(header::ETAG, format!("\"{sha}\""));
+    }
+    let stream = tokio_util::io::ReaderStream::new(file);
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Upload{% endblock %}
+{% block content %}
+<h1>Publish packages</h1>
+
+<div class="stat" style="max-width:640px">
+  <label for="token">Publish token (<span class="mono">rt_…</span>, kept in this tab only)</label><br>
+  <input id="token" type="password" autocomplete="off"
+         style="width:100%;padding:5px 8px;border:1px solid var(--line);font:inherit;margin-top:4px">
+</div>
+
+<div id="drop" style="margin-top:14px;border:2px dashed var(--line);background:var(--panel);
+     padding:34px;text-align:center;color:var(--muted)">
+  Drop <span class="mono">.pkg.tar.zst</span> files here, or
+  <input id="picker" type="file" multiple accept=".pkg.tar.zst" style="font:inherit">
+</div>
+
+<table style="margin-top:14px;display:none" id="results">
+  <tr><th>File</th><th>Result</th></tr>
+</table>
+{% endblock %}
+
+<script>
+const drop = document.getElementById('drop');
+const results = document.getElementById('results');
+
+function addRow(name) {
+  results.style.display = '';
+  const row = results.insertRow(-1);
+  const c1 = row.insertCell(); c1.className = 'mono'; c1.textContent = name;
+  const c2 = row.insertCell();
+  return (text, cls) => { c2.innerHTML = cls ? `<span class="badge st-${cls}"></span> ` : '';
+                          c2.append(text); };
+}
+
+async function sha256Hex(file) {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function upload(file) {
+  const done = addRow(file.name);
+  const token = document.getElementById('token').value.trim();
+  if (!token) { done('no token', 'ahead'); return; }
+  try {
+    const sha = await sha256Hex(file);
+    const resp = await fetch(`/api/repo/publish/${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'x-sha256': sha },
+      body: file,
+    });
+    const text = await resp.text();
+    if (resp.ok) {
+      const r = JSON.parse(text);
+      done(`${r.name} ${r.version}-${r.release} · ${(r.size / 1048576).toFixed(1)} MiB`, r.state);
+    } else {
+      done(text || resp.status, 'ahead');
+    }
+  } catch (e) { done(String(e), 'ahead'); }
+}
+
+function handleFiles(files) { [...files].forEach(upload); }
+document.getElementById('picker').addEventListener('change', e => handleFiles(e.target.files));
+['dragover', 'dragenter'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.style.borderColor = 'var(--accent)'; }));
+['dragleave', 'drop'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.style.borderColor = 'var(--line)'; }));
+drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+</script>

@@ -10,6 +10,25 @@ use recipedia::web::{router, AppState, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        // `recipedia-server token <label>` mints a publish token and exits.
+        Some("token") => {
+            let label = args
+                .get(1)
+                .context("usage: recipedia-server token <label>")?;
+            let config = Config::from_env();
+            let conn = db::open(&config.db_path)?;
+            let token = db::token_create(&conn, label)?;
+            println!("{token}");
+            println!("(store it now — only its SHA-256 is kept)");
+            Ok(())
+        }
+        _ => serve().await,
+    }
+}
+
+async fn serve() -> Result<()> {
     let config = Config::from_env();
     std::fs::create_dir_all(&config.state_dir)?;
     std::fs::create_dir_all(&config.repo_dir)?;

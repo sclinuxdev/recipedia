@@ -8,6 +8,7 @@
 pub mod config;
 pub mod db;
 pub mod model;
+pub mod repo;
 pub mod status;
 pub mod sync;
 pub mod web;
