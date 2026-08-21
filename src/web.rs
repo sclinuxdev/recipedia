@@ -16,7 +16,6 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::{self, PackageRow, PublishedRow, SyncEntry};
-use crate::graph;
 use crate::repo;
 use crate::status::{derive, State as BuildState};
 use crate::sync;
@@ -49,12 +48,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/package/{*name}", get(package_detail))
         .route("/category/{cat}", get(category))
         .route("/status", get(status_page))
-        .route("/graph", get(graph_page))
         .route("/upload", get(upload_page))
         .route("/api/packages", get(api_packages))
         .route("/api/package/{*name}", get(api_package))
         .route("/api/status", get(api_status))
-        .route("/api/graph", get(api_graph))
         .route("/api/webhook/github", post(github_webhook))
         .route(
             "/api/repo/publish/{filename}",
@@ -427,61 +424,6 @@ pub struct UploadTemplate;
 
 async fn upload_page() -> Response {
     Html(UploadTemplate.render().expect("static template")).into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Dependency graph
-// ---------------------------------------------------------------------------
-
-/// Layered layout over the latest-recipe dependency edges; node color carries
-/// the derived build state.
-fn compute_graph(conn: &Connection) -> Result<(graph::Graph, usize)> {
-    let rows = db::latest_packages(conn)?;
-    let published: HashMap<String, (String, String)> = db::published_latest_by_name(conn)?
-        .into_iter()
-        .map(|p| (p.name, (p.version, p.release)))
-        .collect();
-    let total = rows.len();
-    Ok((graph::build(&rows, &published), total))
-}
-
-#[derive(Template)]
-#[template(path = "graph.html")]
-pub struct GraphTemplate {
-    pub svg: String,
-    pub node_count: usize,
-    pub edge_count: usize,
-}
-
-async fn graph_page(State(state): State<SharedState>) -> Response {
-    with_conn(&state, |conn| {
-        let (g, total) = compute_graph(conn)?;
-        let tpl = GraphTemplate { svg: g.render_svg(), node_count: total, edge_count: g.edges.len() };
-        Ok(Html(tpl.render()?).into_response())
-    })
-}
-
-async fn api_graph(State(state): State<SharedState>) -> Response {
-    with_conn(&state, |conn| {
-        let (g, _) = compute_graph(conn)?;
-        let nodes: Vec<serde_json::Value> = g
-            .nodes
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "name": n.name, "level": n.level, "state": n.state.label(),
-                })
-            })
-            .collect();
-        let edges: Vec<serde_json::Value> = g
-            .edges
-            .iter()
-            .map(|&(a, b)| serde_json::json!([g.nodes[a].name, g.nodes[b].name]))
-            .collect();
-        Ok(json_response(&serde_json::json!({
-            "width": g.width, "height": g.height, "nodes": nodes, "edges": edges,
-        })))
-    })
 }
 
 // ---------------------------------------------------------------------------

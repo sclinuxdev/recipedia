@@ -16,8 +16,6 @@ built-in hosting of published binary packages.
   lists and the status board show the newest, detail pages carry the ladder.
 - **Virtual names resolve** — `/package/virtual/libc` doesn't 404: it lists
   the packages whose `provides` cover the name.
-- **Global dependency graph** — `/graph` lays every package out left-to-right
-  by dependency depth, colored by build state, each node linking to its page.
 - **Package hosting** — `POST /api/repo/publish/{filename}` (bearer token)
   streams a `*.pkg.tar.zst` straight to disk, extracts `.METADATA`, regenerates
   an `index.toml` byte-compatible with sage's channel reader, and serves the
