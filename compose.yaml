@@ -1,5 +1,6 @@
 # 1Panel: 容器 -> 编排 -> 创建编排, 原样粘贴本文件即可。
-# 状态(SQLite + git 镜像 + 已发布包)全部落在编排目录的 ./data, 备份它就备份了一切。
+# 状态(SQLite + git 镜像 + 已发布包)全部落在数据卷里; 建议在编排的 .env 中设
+# RECIPEEDIA_DATA_DIR=/srv/recipedia 把它钉在固定绝对路径, 删编排/换位置都不丢。
 services:
   recipedia:
     build: https://github.com/sclinuxdev/recipedia.git
@@ -9,7 +10,7 @@ services:
     ports:
       - "127.0.0.1:8300:8300" # 只绑宿主机回环, 公网访问走 1Panel 网站反代
     volumes:
-      - ./data:/data
+      - ${RECIPEEDIA_DATA_DIR:-./data}:/data
     environment:
       # GitHub webhook 密钥(可选, 不设则只靠轮询同步)
       RECIPEEDIA_WEBHOOK_SECRET: ${RECIPEEDIA_WEBHOOK_SECRET:-}
