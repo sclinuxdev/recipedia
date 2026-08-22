@@ -124,6 +124,30 @@ pub struct PublishedRow {
     pub size: i64,
     pub sha256: String,
     pub uploaded_at: i64,
+    /// Manifest meta stored at publish time; carries the build-provenance
+    /// stamps (compiler, flags) when the builder recorded any.
+    pub meta: Option<crate::repo::ManifestMeta>,
+}
+
+/// Row mapper shared by every `published` query: eight plain columns plus
+/// the meta JSON column, deserialized leniently (bad JSON → None).
+fn row_to_published(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublishedRow> {
+    let meta_json: String = r.get(8)?;
+    Ok(PublishedRow {
+        filename: r.get(0)?,
+        name: r.get(1)?,
+        version: r.get(2)?,
+        release: r.get(3)?,
+        arch: r.get(4)?,
+        size: r.get(5)?,
+        sha256: r.get(6)?,
+        uploaded_at: r.get(7)?,
+        meta: if meta_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&meta_json).ok()
+        },
+    })
 }
 
 /// Replace the whole recipe cache in one shot: fill a temporary table, then
@@ -300,21 +324,10 @@ pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
 /// name may carry several; this folds them to the representative one.
 pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at FROM published",
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta FROM published",
     )?;
     let all = stmt
-        .query_map([], |r| {
-            Ok(PublishedRow {
-                filename: r.get(0)?,
-                name: r.get(1)?,
-                version: r.get(2)?,
-                release: r.get(3)?,
-                arch: r.get(4)?,
-                size: r.get(5)?,
-                sha256: r.get(6)?,
-                uploaded_at: r.get(7)?,
-            })
-        })?
+        .query_map([], row_to_published)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut best: std::collections::HashMap<String, PublishedRow> =
         std::collections::HashMap::new();
@@ -344,22 +357,11 @@ pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> 
 /// Every published archive, newest upload first -- the repo file browser.
 pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta
          FROM published ORDER BY uploaded_at DESC",
     )?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(PublishedRow {
-                filename: r.get(0)?,
-                name: r.get(1)?,
-                version: r.get(2)?,
-                release: r.get(3)?,
-                arch: r.get(4)?,
-                size: r.get(5)?,
-                sha256: r.get(6)?,
-                uploaded_at: r.get(7)?,
-            })
-        })?
+        .query_map([], row_to_published)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -368,22 +370,11 @@ pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
 /// version ladder of what actually landed in the repository.
 pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta
          FROM published WHERE name = ?1 ORDER BY uploaded_at DESC",
     )?;
     let rows = stmt
-        .query_map(params![name], |r| {
-            Ok(PublishedRow {
-                filename: r.get(0)?,
-                name: r.get(1)?,
-                version: r.get(2)?,
-                release: r.get(3)?,
-                arch: r.get(4)?,
-                size: r.get(5)?,
-                sha256: r.get(6)?,
-                uploaded_at: r.get(7)?,
-            })
-        })?
+        .query_map(params![name], row_to_published)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -616,6 +607,16 @@ impl SyncEntry {
     pub fn when(&self) -> String {
         time_hm_pub(self.started_at)
     }
+    /// Same instant as UTC ISO-8601 for `<time datetime>`.
+    pub fn when_iso(&self) -> String {
+        time_utc(self.started_at)
+    }
+}
+
+/// One renderable build-flag line of the provenance block.
+pub struct FlagLine {
+    pub label: &'static str,
+    pub value: String,
 }
 
 impl PublishedRow {
@@ -623,9 +624,56 @@ impl PublishedRow {
     pub fn built_at(&self) -> String {
         time_hm_pub(self.uploaded_at)
     }
+    /// Same instant as UTC ISO-8601 for `<time datetime>` (client-side
+    /// timezone conversion).
+    pub fn built_iso(&self) -> String {
+        time_utc(self.uploaded_at)
+    }
     /// Archive size in MiB, one decimal (template helper).
     pub fn size_mib(&self) -> String {
         format!("{:.1}", self.size as f64 / 1_048_576.0)
+    }
+    /// True when the builder stamped any build provenance. Packages without
+    /// compilation evidence (os-release and friends) stay unstamped and the
+    /// page renders nothing rather than an inference.
+    pub fn has_build_info(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| {
+            !(m.build_compiler.is_empty()
+                && m.build_cflags.is_empty()
+                && m.build_cxxflags.is_empty()
+                && m.build_ldflags.is_empty())
+        })
+    }
+    /// "clang 22.1.8" style stamp; empty when the build recorded no compiler.
+    pub fn compiler_line(&self) -> String {
+        let Some(m) = &self.meta else {
+            return String::new();
+        };
+        if m.build_compiler.is_empty() {
+            return String::new();
+        }
+        if m.build_compiler_version.is_empty() {
+            return m.build_compiler.clone();
+        }
+        format!("{} {}", m.build_compiler, m.build_compiler_version)
+    }
+    /// The stamped flag lines, in display order; empty when none recorded.
+    pub fn flag_lines(&self) -> Vec<FlagLine> {
+        let Some(m) = &self.meta else {
+            return Vec::new();
+        };
+        [
+            ("CFLAGS", &m.build_cflags),
+            ("CXXFLAGS", &m.build_cxxflags),
+            ("LDFLAGS", &m.build_ldflags),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(label, value)| FlagLine {
+            label,
+            value: value.clone(),
+        })
+        .collect()
     }
 }
 

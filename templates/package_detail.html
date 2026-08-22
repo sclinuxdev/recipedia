@@ -21,14 +21,29 @@
 
 {% if !published.is_empty() %}
 <h2>Published builds</h2>
+<p class="muted">The compiler column reflects the stamps recorded by <code>sage build</code> — it appears only when the build produced compilation evidence, so data-only packages show none.</p>
 <table>
-  <tr><th>Version</th><th>File</th><th>Size</th><th>Published</th></tr>
+  <tr><th>Version</th><th>File</th><th>Size</th><th>Published</th><th>Built with</th></tr>
   {% for p in published %}
   <tr>
     <td class="mono">{{ p.version }}-{{ p.release }}</td>
-    <td class="mono"><a href="{{ repo_prefix }}/{{ p.filename }}">{{ p.filename }}</a></td>
+    <td class="mono"><a href="{{ nav.repo }}/{{ p.filename }}">{{ p.filename }}</a></td>
     <td class="mono muted">{{ p.size_mib() }} MiB</td>
-    <td class="mono muted">{{ p.built_at() }}</td>
+    <td class="mono muted"><time class="ts" datetime="{{ p.built_iso() }}">{{ p.built_at() }}</time></td>
+    {% if p.has_build_info() %}
+    <td class="mono">
+      {% if !p.compiler_line().is_empty() %}{{ p.compiler_line() }}{% endif %}
+      {% if !p.flag_lines().is_empty() %}
+      <details><summary>flags</summary>
+        {% for f in p.flag_lines() %}
+        <div>{{ f.label }} <span class="mono">{{ f.value }}</span></div>
+        {% endfor %}
+      </details>
+      {% endif %}
+    </td>
+    {% else %}
+    <td class="muted">—</td>
+    {% endif %}
   </tr>
   {% endfor %}
 </table>

@@ -14,7 +14,7 @@
       <td class="mono">{{ f.version }}-{{ f.release }}</td>
       <td>{{ f.arch }}</td>
       <td class="num">{{ f.size_mib() }} MiB</td>
-      <td>{{ f.built_at() }}</td>
+      <td><time class="ts" datetime="{{ f.built_iso() }}">{{ f.built_at() }}</time></td>
     </tr>
   {% endfor %}
   {% if files.is_empty() %}

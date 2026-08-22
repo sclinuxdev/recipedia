@@ -73,6 +73,37 @@ pub fn router(state: SharedState) -> Router {
 // View models
 // ---------------------------------------------------------------------------
 
+/// Navigation links shared by every page. Frontend pages live on the main
+/// site origin (`RECIPEEDIA_FRONTEND_URL`); the repository browser may be
+/// exposed on its own domain (`RECIPEEDIA_REPO_URL`). Empty bases keep
+/// same-origin root-relative links so a dev checkout just works.
+#[derive(Debug, Clone)]
+pub struct Nav {
+    pub home: String,
+    pub packages: String,
+    pub status: String,
+    pub upload: String,
+    pub repo: String,
+}
+
+impl Nav {
+    pub fn from_config(config: &Config) -> Self {
+        let fe = config.frontend_url.as_str();
+        let repo = if config.repo_base.is_empty() {
+            "/repo".to_string()
+        } else {
+            config.repo_base.clone()
+        };
+        Nav {
+            home: format!("{fe}/"),
+            packages: format!("{fe}/packages"),
+            status: format!("{fe}/status"),
+            upload: format!("{fe}/upload"),
+            repo,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PackageView {
     pub name: String,
@@ -148,6 +179,7 @@ pub struct IndexTemplate {
     pub categories: Vec<db::CategoryCount>,
     pub recent_syncs: Vec<SyncEntry>,
     pub commit: String,
+    pub nav: Nav,
 }
 
 async fn index(State(state): State<SharedState>) -> Response {
@@ -166,6 +198,7 @@ async fn index(State(state): State<SharedState>) -> Response {
             categories,
             recent_syncs,
             commit,
+            nav: Nav::from_config(&state.config),
         };
         Ok(Html(tpl.render()?).into_response())
     })
@@ -179,6 +212,7 @@ pub struct PackagesTemplate {
     pub category: String,
     pub state: String,
     pub total: usize,
+    pub nav: Nav,
 }
 
 async fn packages(
@@ -201,7 +235,7 @@ async fn packages(
                 && (state_filter.is_empty() || v.state.label() == state_filter)
         });
         let total = rows.len();
-        let tpl = PackagesTemplate { rows, q, category, state: state_filter, total };
+        let tpl = PackagesTemplate { rows, q, category, state: state_filter, total, nav: Nav::from_config(&app.config) };
         Ok(Html(tpl.render()?).into_response())
     })
 }
@@ -233,9 +267,7 @@ pub struct DetailTemplate {
     pub has_log: bool,
     pub log_content: String,
     pub log_builder: String,
-    /// Base for archive links: the public repo domain when configured,
-    /// same-origin `/repo` otherwise.
-    pub repo_prefix: String,
+    pub nav: Nav,
 }
 
 async fn package_detail(
@@ -252,7 +284,7 @@ async fn package_detail(
                 // `cc`, ...): list the providers instead of dead-ending.
                 let provider_names = db::providers(conn, &name)?;
                 if !provider_names.is_empty() {
-                    return render_virtual(conn, &name, &provider_names);
+                    return render_virtual(conn, &name, &provider_names, Nav::from_config(&state.config));
                 }
                 // Published but recipeless (recipe removed / pre-tree build):
                 // describe it from its own manifest meta.
@@ -312,11 +344,7 @@ async fn package_detail(
             reverse,
             recipe_toml,
             github_url,
-            repo_prefix: if state.config.repo_base.is_empty() {
-                "/repo".to_string()
-            } else {
-                state.config.repo_base.clone()
-            },
+            nav: Nav::from_config(&state.config),
         };
         Ok(Html(tpl.render()?).into_response())
     })
@@ -336,16 +364,22 @@ pub struct ProviderView {
 pub struct VirtualTemplate {
     pub name: String,
     pub providers: Vec<ProviderView>,
+    pub nav: Nav,
 }
 
-fn render_virtual(conn: &Connection, name: &str, provider_names: &[String]) -> Result<Response> {
+fn render_virtual(
+    conn: &Connection,
+    name: &str,
+    provider_names: &[String],
+    nav: Nav,
+) -> Result<Response> {
     let wanted: std::collections::HashSet<&str> =
         provider_names.iter().map(String::as_str).collect();
     let providers = package_views(conn, |r| wanted.contains(r.name.as_str()))?
         .into_iter()
         .map(|v| ProviderView { name: v.name, state: v.state, repo_version: v.repo_version })
         .collect();
-    Ok(Html(VirtualTemplate { name: name.to_string(), providers }.render()?).into_response())
+    Ok(Html(VirtualTemplate { name: name.to_string(), providers, nav }.render()?).into_response())
 }
 
 /// A pseudo-recipe row for a package that exists only in the repository:
@@ -378,6 +412,7 @@ pub struct CategoryTemplate {
     pub category: String,
     pub state: String,
     pub total: usize,
+    pub nav: Nav,
 }
 
 async fn category(State(state): State<SharedState>, AxPath(cat): AxPath<String>) -> Response {
@@ -390,6 +425,7 @@ async fn category(State(state): State<SharedState>, AxPath(cat): AxPath<String>)
             category: cat,
             state: String::new(),
             total,
+            nav: Nav::from_config(&state.config),
         };
         Ok(Html(tpl.render()?).into_response())
     })
@@ -402,6 +438,7 @@ pub struct StatusTemplate {
     pub outdated: Vec<PackageView>,
     pub ahead: Vec<PackageView>,
     pub built: usize,
+    pub nav: Nav,
 }
 
 async fn status_page(State(state): State<SharedState>) -> Response {
@@ -413,17 +450,20 @@ async fn status_page(State(state): State<SharedState>) -> Response {
         let built = views.iter().filter(|v| v.state == BuildState::Built).count();
         missing.sort_by(|a, b| a.name.cmp(&b.name));
         outdated.sort_by(|a, b| a.name.cmp(&b.name));
-        let tpl = StatusTemplate { missing, outdated, ahead, built };
+        let tpl = StatusTemplate { missing, outdated, ahead, built, nav: Nav::from_config(&state.config) };
         Ok(Html(tpl.render()?).into_response())
     })
 }
 
 #[derive(Template)]
 #[template(path = "upload.html")]
-pub struct UploadTemplate;
+pub struct UploadTemplate {
+    pub nav: Nav,
+}
 
-async fn upload_page() -> Response {
-    Html(UploadTemplate.render().expect("static template")).into_response()
+async fn upload_page(State(state): State<SharedState>) -> Response {
+    let tpl = UploadTemplate { nav: Nav::from_config(&state.config) };
+    Html(tpl.render().expect("static template")).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +654,7 @@ async fn upload_log(
 pub struct RepoIndexTemplate {
     pub files: Vec<PublishedRow>,
     pub total_mib: String,
+    pub nav: Nav,
 }
 
 /// Browsable listing of everything published: this is what
@@ -625,6 +666,7 @@ async fn repo_index(State(state): State<SharedState>) -> Response {
         let tpl = RepoIndexTemplate {
             total_mib: format!("{:.1}", bytes as f64 / 1_048_576.0),
             files,
+            nav: Nav::from_config(&state.config),
         };
         Ok(Html(tpl.render()?).into_response())
     })

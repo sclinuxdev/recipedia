@@ -18,6 +18,10 @@ pub struct Config {
     /// Public base URL the frontend links repo files at (e.g.
     /// `https://repo.example.com`); empty keeps same-origin `/repo/...`.
     pub repo_base: String,
+    /// Public origin of the main site's pages (e.g. `https://rp.example.com`)
+    /// so the shared nav points there even when served from the repo domain;
+    /// empty keeps same-origin root-relative links.
+    pub frontend_url: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -39,6 +43,7 @@ impl Config {
             webhook_secret: std::env::var("RECIPEEDIA_WEBHOOK_SECRET").ok(),
             poll_secs: env_or("RECIPEEDIA_POLL_SECS", "600").parse().unwrap_or(600),
             repo_base: env_or("RECIPEEDIA_REPO_URL", "").trim_end_matches('/').to_string(),
+            frontend_url: env_or("RECIPEEDIA_FRONTEND_URL", "").trim_end_matches('/').to_string(),
         }
     }
 

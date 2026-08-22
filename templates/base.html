@@ -56,14 +56,26 @@
 <header class="site"><div class="inner">
   <div class="brand">Reci<span>pedia</span></div>
   <nav>
-    <a href="/">Home</a>
-    <a href="/packages">Packages</a>
-    <a href="/status">Build Status</a>
-    <a href="/upload">Upload</a>
+    <a href="{{ nav.home }}">Home</a>
+    <a href="{{ nav.packages }}">Packages</a>
+    <a href="{{ nav.status }}">Build Status</a>
+    <a href="{{ nav.upload }}">Upload</a>
+    <a href="{{ nav.repo }}">Repo</a>
   </nav>
   <div style="margin-left:auto" class="muted">sclinux · recipes</div>
 </div></header>
 <main>{% block content %}{% endblock %}</main>
 <footer>Recipedia serves the sclinuxdev/recipes tree read-only; the git repository is the single source of truth.</footer>
+<script>
+  // Timestamps are server-rendered as UTC; rewrite them in the visitor's
+  // timezone once the DOM is up (the UTC text stays as the no-JS fallback).
+  document.querySelectorAll('time.ts').forEach(function (el) {
+    var d = new Date(el.getAttribute('datetime'));
+    if (isNaN(d)) return;
+    var pad = function (n) { return String(n).padStart(2, '0'); };
+    el.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+      + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  });
+</script>
 </body>
 </html>

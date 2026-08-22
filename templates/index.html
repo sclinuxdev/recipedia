@@ -27,7 +27,7 @@
   <tr><th>When</th><th>Trigger</th><th>Commit</th><th>Result</th></tr>
   {% for s in recent_syncs %}
   <tr>
-    <td class="mono">{{ s.when() }}</td>
+    <td class="mono"><time class="ts" datetime="{{ s.when_iso() }}">{{ s.when() }}</time></td>
     <td>{{ s.trigger }}</td>
     <td class="mono">{{ s.commit }}</td>
     <td>{% if s.ok %}ok · {{ s.message }}{% else %}<span class="badge st-ahead">failed</span> · {{ s.message }}{% endif %}</td>
