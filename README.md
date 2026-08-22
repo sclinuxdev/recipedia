@@ -1,7 +1,7 @@
 # Recipedia
 
 sclinux recipe & repository hub — a read-only web presentation of the
-[sclinuxdev/recipes](https://github.com/sclinuxdev/recipes) git tree, plus
+[sclinuxdev/recipes](https://github.com/sclinuxdev/recipes.amd64) git tree, plus
 built-in hosting of published binary packages.
 
 ## What it does

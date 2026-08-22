@@ -39,7 +39,7 @@ impl Config {
             )),
             repo_dir: state_dir.join("repo"),
             state_dir,
-            git_url: env_or("RECIPEEDIA_GIT_URL", "https://github.com/sclinuxdev/recipes"),
+            git_url: env_or("RECIPEEDIA_GIT_URL", "https://github.com/sclinuxdev/recipes.amd64"),
             webhook_secret: std::env::var("RECIPEEDIA_WEBHOOK_SECRET").ok(),
             poll_secs: env_or("RECIPEEDIA_POLL_SECS", "600").parse().unwrap_or(600),
             repo_base: env_or("RECIPEEDIA_REPO_URL", "").trim_end_matches('/').to_string(),

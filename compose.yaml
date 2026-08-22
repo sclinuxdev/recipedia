@@ -16,7 +16,7 @@ services:
     environment:
       # GitHub webhook 密钥(可选, 不设则只靠轮询同步)
       RECIPEEDIA_WEBHOOK_SECRET: ${RECIPEEDIA_WEBHOOK_SECRET:-}
-      RECIPEEDIA_GIT_URL: ${RECIPEEDIA_GIT_URL:-https://github.com/sclinuxdev/recipes}
+      RECIPEEDIA_GIT_URL: ${RECIPEEDIA_GIT_URL:-https://github.com/sclinuxdev/recipes.amd64}
       RECIPEEDIA_POLL_SECS: ${RECIPEEDIA_POLL_SECS:-600}
       # 主站页面所在域: 导航 Home/Packages/Build Status/Upload 指向它;
       # 不填则走当前访问域的相对路径

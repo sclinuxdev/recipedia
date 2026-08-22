@@ -31,7 +31,7 @@
 {% endif %}
 
 <table>
-  <tr><th>Name</th><th>Version</th><th>Category</th><th>State</th><th>Built</th><th>Description</th></tr>
+  <tr><th>Name</th><th>Version</th><th>Category</th><th>State</th><th>Published</th><th>Description</th></tr>
   {% for r in rows %}
   <tr>
     <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
@@ -41,7 +41,7 @@
       {% endif %}</td>
     <td><a href="/category/{{ r.category }}">{{ r.category }}</a></td>
     <td><span class="badge st-{{ r.state.label() }}">{{ r.state.label() }}</span></td>
-    <td class="mono muted">{% if !r.built_iso().is_empty() %}<time class="ts" datetime="{{ r.built_iso() }}">{{ r.built_time() }}</time>{% endif %}</td>
+    <td class="mono muted">{% if !r.published_iso().is_empty() %}<time class="ts" datetime="{{ r.published_iso() }}">{{ r.published_time() }}</time>{% endif %}</td>
     <td class="muted">{{ r.description }}</td>
   </tr>
   {% endfor %}

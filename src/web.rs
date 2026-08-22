@@ -120,12 +120,12 @@ pub struct PackageView {
 
 impl PackageView {
     /// Renderable build time for list pages (empty when nothing published).
-    pub fn built_time(&self) -> String {
+    pub fn published_time(&self) -> String {
         if self.built_at > 0 { db::time_hm_pub(self.built_at) } else { String::new() }
     }
     /// Same instant as UTC ISO-8601 for `<time datetime>` (client-side
     /// timezone conversion); empty when nothing published.
-    pub fn built_iso(&self) -> String {
+    pub fn published_iso(&self) -> String {
         if self.built_at > 0 { db::time_utc(self.built_at) } else { String::new() }
     }
     /// True when the repository carries a different version than the recipe.
