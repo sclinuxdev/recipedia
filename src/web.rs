@@ -123,6 +123,11 @@ impl PackageView {
     pub fn built_time(&self) -> String {
         if self.built_at > 0 { db::time_hm_pub(self.built_at) } else { String::new() }
     }
+    /// Same instant as UTC ISO-8601 for `<time datetime>` (client-side
+    /// timezone conversion); empty when nothing published.
+    pub fn built_iso(&self) -> String {
+        if self.built_at > 0 { db::time_utc(self.built_at) } else { String::new() }
+    }
     /// True when the repository carries a different version than the recipe.
     pub fn repo_differs(&self) -> bool {
         !self.repo_version.is_empty() && self.repo_version != format!("{}-{}", self.version, self.release)

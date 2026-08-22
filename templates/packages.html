@@ -41,7 +41,7 @@
       {% endif %}</td>
     <td><a href="/category/{{ r.category }}">{{ r.category }}</a></td>
     <td><span class="badge st-{{ r.state.label() }}">{{ r.state.label() }}</span></td>
-    <td class="mono muted">{{ r.built_time() }}</td>
+    <td class="mono muted">{% if !r.built_iso().is_empty() %}<time class="ts" datetime="{{ r.built_iso() }}">{{ r.built_time() }}</time>{% endif %}</td>
     <td class="muted">{{ r.description }}</td>
   </tr>
   {% endfor %}
