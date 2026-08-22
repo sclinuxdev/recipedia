@@ -1,7 +1,7 @@
 # Runtime-only image: pulls the released static musl binaries instead of
 # compiling. Pin with --build-arg RECIPEEDIA_VERSION=v0.0.2 (no leading v in
 # the default keeps older compose files working; the tag always carries it).
-ARG RECIPEEDIA_VERSION=0.0.1
+ARG RECIPEEDIA_VERSION=0.0.2
 FROM alpine:3
 ARG RECIPEEDIA_VERSION
 RUN set -eux; ver="${RECIPEEDIA_VERSION#v}"; \
