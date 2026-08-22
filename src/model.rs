@@ -68,7 +68,17 @@ impl Recipe {
     pub fn from_toml(text: &str) -> Result<Self> {
         let doc: toml::Table = toml::from_str(text).context("recipe.toml is not valid TOML")?;
         let pkg = doc.get("package").and_then(|v| v.as_table());
-        let src = doc.get("source").and_then(|v| v.as_table());
+        // `[source]` may be a single table or a `[[source]]` array of tables;
+        // for multi-source recipes element zero is the primary archive -- the
+        // one sage unpacks into src/.
+        let mut source_scopes: Vec<&toml::Table> = Vec::new();
+        match doc.get("source") {
+            Some(toml::Value::Table(t)) => source_scopes.push(t),
+            Some(toml::Value::Array(a)) => {
+                source_scopes.extend(a.iter().filter_map(|v| v.as_table()))
+            }
+            _ => {}
+        }
 
         // Three-scope merge: root first, then [package], then [source] --
         // later scopes win, matching sage's parser.
@@ -84,7 +94,11 @@ impl Recipe {
         let mut build_dependencies = table_strings(&doc, "build_dependencies");
         let mut provides = table_strings(&doc, "provides");
         let mut conffiles = table_strings(&doc, "conffiles");
-        for scope in [pkg, src].into_iter().flatten() {
+        for scope in [pkg]
+            .into_iter()
+            .flatten()
+            .chain(source_scopes.iter().copied())
+        {
             name = table_str(scope, "name").or(name);
             version = table_str(scope, "version").or(version);
             release = table_str(scope, "release").or(release);
@@ -98,6 +112,14 @@ impl Recipe {
             build_dependencies.extend(table_strings(scope, "build_dependencies"));
             provides.extend(table_strings(scope, "provides"));
             conffiles.extend(table_strings(scope, "conffiles"));
+        }
+
+        // The loop's last-writer-wins chain would let the final [[source]]
+        // element override earlier ones; re-apply element zero so the primary
+        // archive's url/sha256 always win.
+        if let Some(primary) = source_scopes.first() {
+            source_url = table_str(primary, "url").or(source_url);
+            source_sha256 = table_str(primary, "sha256").or(source_sha256);
         }
 
         let name = name.context("recipe has no name")?;
@@ -116,5 +138,52 @@ impl Recipe {
             provides,
             conffiles,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_source_table() {
+        let r = Recipe::from_toml(
+            "[package]\n\
+             name = \"os-release\"\n\
+             version = \"1\"\n\
+             release = \"1\"\n\
+             \n\
+             [source]\n\
+             url = \"https://example.com/a.tar.gz\"\n\
+             sha256 = \"777\"\n",
+        )
+        .unwrap();
+        assert_eq!(r.source_url, "https://example.com/a.tar.gz");
+        assert_eq!(r.source_sha256, "777");
+    }
+
+    #[test]
+    fn multi_source_array_primary_element_wins() {
+        // bash-style [[source]] arrays: patches follow the tarball, so the
+        // detail page must show element zero -- the archive sage unpacks.
+        let r = Recipe::from_toml(
+            "name = \"bash\"\n\
+             version = \"5.3\"\n\
+             release = \"1\"\n\
+             \n\
+             [[source]]\n\
+             url = \"https://ftpmirror.gnu.org/gnu/bash/bash-5.3.tar.gz\"\n\
+             sha256 = \"aaa\"\n\
+             \n\
+             [[source]]\n\
+             url = \"https://ftpmirror.gnu.org/gnu/bash/bash-5.3-patch01\"\n\
+             sha256 = \"bbb\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            r.source_url,
+            "https://ftpmirror.gnu.org/gnu/bash/bash-5.3.tar.gz"
+        );
+        assert_eq!(r.source_sha256, "aaa");
     }
 }
