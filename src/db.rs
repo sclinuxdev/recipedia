@@ -645,6 +645,8 @@ impl PublishedRow {
         })
     }
     /// "clang 22.1.8" style stamp; empty when the build recorded no compiler.
+    /// Sage's paired form ("clang: 22.1.8, gcc: 15.3.0" — one version per
+    /// producer, crt traces included) renders as "clang 22.1.8 · gcc 15.3.0".
     pub fn compiler_line(&self) -> String {
         let Some(m) = &self.meta else {
             return String::new();
@@ -655,7 +657,15 @@ impl PublishedRow {
         if m.build_compiler_version.is_empty() {
             return m.build_compiler.clone();
         }
-        format!("{} {}", m.build_compiler, m.build_compiler_version)
+        if m.build_compiler_version.contains(": ") {
+            m.build_compiler_version
+                .split(", ")
+                .map(|pair| pair.replace(": ", " "))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        } else {
+            format!("{} {}", m.build_compiler, m.build_compiler_version)
+        }
     }
     /// The stamped flag lines, in display order; empty when none recorded.
     pub fn flag_lines(&self) -> Vec<FlagLine> {
