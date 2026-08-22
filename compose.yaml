@@ -16,6 +16,9 @@ services:
       RECIPEEDIA_WEBHOOK_SECRET: ${RECIPEEDIA_WEBHOOK_SECRET:-}
       RECIPEEDIA_GIT_URL: ${RECIPEEDIA_GIT_URL:-https://github.com/sclinuxdev/recipes}
       RECIPEEDIA_POLL_SECS: ${RECIPEEDIA_POLL_SECS:-600}
-      # repo 独立域名时填它(如 https://repo.example.com), 前端文件链接会指向该域;
-      # 不填则走同域 /repo/ 路径
+      # 主站页面所在域(如 https://rp.example.com): 导航里的 Home/Packages 等
+      # 指向它; 不填则全部走当前访问域的相对路径
+      RECIPEEDIA_FRONTEND_URL: ${RECIPEEDIA_FRONTEND_URL:-}
+      # repo 独立域名时填域根本身(如 https://repo.example.com, 不带 /repo 路径;
+      # 反代需把该域的 / 转发到应用的 /repo/)。不填则走同域 /repo/ 路径
       RECIPEEDIA_REPO_URL: ${RECIPEEDIA_REPO_URL:-}
