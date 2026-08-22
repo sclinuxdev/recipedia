@@ -792,7 +792,13 @@ async fn api_status(State(app): State<SharedState>) -> Response {
         let entries: Vec<ApiStatusEntry> = db::all_packages(conn)?
             .iter()
             .map(|r| {
-                let published = published.get(&r.name);
+                // Pair each recipe row with a published build of the SAME
+                // version: the index keeps only the newest build per name,
+                // and comparing an old version row against it reported every
+                // superserved version as forever 'ahead'.
+                let published = published
+                    .get(&r.name)
+                    .filter(|p| p.version == r.version);
                 ApiStatusEntry {
                     name: r.name.clone(),
                     state: derive(
