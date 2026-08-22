@@ -1,9 +1,11 @@
 # 1Panel: 容器 -> 编排 -> 创建编排, 原样粘贴本文件即可。
+# 镜像不在这里构建: 先在服务器上执行一次(升级时改版本号重跑再 up -d)
+#   docker build --build-arg RECIPEEDIA_VERSION=0.0.1 \
+#     -t recipedia:latest https://github.com/sclinuxdev/recipedia.git
 # 状态(SQLite + git 镜像 + 已发布包)全部落在数据卷里; 建议在编排的 .env 中设
 # RECIPEEDIA_DATA_DIR=/srv/recipedia 把它钉在固定绝对路径, 删编排/换位置都不丢。
 services:
   recipedia:
-    build: https://github.com/sclinuxdev/recipedia.git
     image: recipedia:latest
     container_name: recipedia
     restart: unless-stopped
@@ -16,9 +18,17 @@ services:
       RECIPEEDIA_WEBHOOK_SECRET: ${RECIPEEDIA_WEBHOOK_SECRET:-}
       RECIPEEDIA_GIT_URL: ${RECIPEEDIA_GIT_URL:-https://github.com/sclinuxdev/recipes}
       RECIPEEDIA_POLL_SECS: ${RECIPEEDIA_POLL_SECS:-600}
-      # 主站页面所在域(如 https://rp.example.com): 导航里的 Home/Packages 等
-      # 指向它; 不填则全部走当前访问域的相对路径
-      RECIPEEDIA_FRONTEND_URL: ${RECIPEEDIA_FRONTEND_URL:-}
-      # repo 独立域名时填域根本身(如 https://repo.example.com, 不带 /repo 路径;
-      # 反代需把该域的 / 转发到应用的 /repo/)。不填则走同域 /repo/ 路径
-      RECIPEEDIA_REPO_URL: ${RECIPEEDIA_REPO_URL:-}
+      # 主站页面所在域: 导航 Home/Packages/Build Status/Upload 指向它;
+      # 不填则走当前访问域的相对路径
+      RECIPEEDIA_FRONTEND_URL: ${RECIPEEDIA_FRONTEND_URL:-https://rp.qzkago.com}
+      # repo 文件浏览域的域根(不带 /repo 路径): 导航 Repo 与下载链接指向它;
+      # 反代把该域的 / 转发到应用的 /repo/(见下)。不填则走同域 /repo/
+      RECIPEEDIA_REPO_URL: ${RECIPEEDIA_REPO_URL:-https://repo.qzkago.com}
+
+# 1Panel 两个网站的反代配置(nginx):
+#   rp.qzkago.com   -> proxy_pass http://127.0.0.1:8300;
+#                      并加 client_max_body_size 8192m; (网页上传大包走这个域)
+#   repo.qzkago.com -> proxy_pass http://127.0.0.1:8300/repo/;
+#                      尾斜杠必须有: 它把 / 前缀映射成上游的 /repo/ 前缀,
+#                      于是 https://repo.qzkago.com/<文件名> 直出包档案。
+
