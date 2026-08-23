@@ -15,5 +15,5 @@ ENV RECIPEEDIA_STATE_DIR=/data \
     RECIPEEDIA_LISTEN=0.0.0.0:8300
 VOLUME /data
 EXPOSE 8300
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["recipedia-server"]
