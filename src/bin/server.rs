@@ -46,14 +46,14 @@ async fn serve() -> Result<()> {
         let trigger = "boot".to_string();
         tokio::task::spawn_blocking(move || {
             let conn = st.db.lock().expect("boot sync: db mutex poisoned");
-            match sync::run_sync(&conn, &st.config.git_url, &st.config.git_dir(), &trigger) {
+            match sync::run_sync(&conn, &st.config, &trigger) {
                 Ok(count) => println!("boot sync: {count} recipes"),
                 Err(err) => eprintln!("boot sync failed: {err:#}"),
             }
         });
     }
 
-    // Fallback poll: cheap remote-HEAD probe, full sync only on change.
+    // Fallback poll: cheap remote-HEAD probe per tree, full sync only on change.
     {
         let st = state.clone();
         let poll_secs = config.poll_secs;
@@ -66,27 +66,50 @@ async fn serve() -> Result<()> {
                 if st.syncing.load(std::sync::atomic::Ordering::SeqCst) {
                     continue;
                 }
-                let git_url = st.config.git_url.clone();
-                let remote = tokio::task::spawn_blocking(move || sync::remote_head(&git_url)).await;
-                let remote = match remote {
-                    Ok(Ok(sha)) => sha,
-                    Ok(Err(err)) => {
-                        eprintln!("poll: remote probe failed: {err:#}");
-                        continue;
-                    }
+                // Probe every tree; any change (or an unknown HEAD) syncs
+                // the whole combined world in one pass.
+                let probes = {
+                    let st = st.clone();
+                    tokio::task::spawn_blocking(move || {
+                        st.config
+                            .git_sources
+                            .iter()
+                            .map(|s| {
+                                let stored = {
+                                    let conn = st.db.lock().expect("poll: db mutex poisoned");
+                                    db::meta_get(&conn, &format!("last_commit:{}", s.arch))
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default()
+                                };
+                                (s.arch.clone(), s.url.clone(), sync::remote_head(&s.url), stored)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                };
+                let probes = match probes {
+                    Ok(p) => p,
                     Err(err) => {
                         eprintln!("poll: probe task failed: {err}");
                         continue;
                     }
                 };
-                let known = {
-                    let conn = st.db.lock().expect("poll: db mutex poisoned");
-                    db::meta_get(&conn, "last_commit").ok().flatten()
-                };
-                if known.as_deref() != Some(remote.as_str()) {
-                    println!("poll: remote moved to {remote}, syncing");
-                    recipedia::web::trigger_sync(st.clone(), "poll").await;
+                let mut changed = false;
+                for (arch, url, remote, stored) in &probes {
+                    match remote {
+                        Ok(sha) if sha == stored => {}
+                        Ok(sha) => {
+                            changed = true;
+                            println!("poll: {arch} remote moved to {sha}, syncing");
+                        }
+                        Err(err) => eprintln!("poll: {arch} probe failed: {err:#} ({url})"),
+                    }
                 }
+                if !changed {
+                    continue;
+                }
+                recipedia::web::trigger_sync(st.clone(), "poll").await;
             }
         });
     }

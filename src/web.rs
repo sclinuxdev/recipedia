@@ -48,6 +48,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/package/{*name}", get(package_detail))
         .route("/category/{cat}", get(category))
         .route("/status", get(status_page))
+        .route("/about", get(about_page))
         .route("/upload", get(upload_page))
         .route("/api/packages", get(api_packages))
         .route("/api/package/{*name}", get(api_package))
@@ -84,9 +85,15 @@ pub struct Nav {
     pub status: String,
     pub upload: String,
     pub repo: String,
+    pub about: String,
 }
 
 impl Nav {
+    /// Serving build version for the footer.
+    pub fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     pub fn from_config(config: &Config) -> Self {
         let fe = config.frontend_url.as_str();
         let repo = if config.repo_base.is_empty() {
@@ -99,6 +106,7 @@ impl Nav {
             packages: format!("{fe}/packages"),
             status: format!("{fe}/status"),
             upload: format!("{fe}/upload"),
+            about: format!("{fe}/about"),
             repo,
         }
     }
@@ -107,6 +115,10 @@ impl Nav {
 #[derive(Debug, Clone)]
 pub struct PackageView {
     pub name: String,
+    /// Effective architecture of the recipe (amd64 / aarch64 / any).
+    pub arch: String,
+    /// URL of the recipes tree this row came from.
+    pub origin: String,
     pub category: String,
     pub version: String,
     pub release: String,
@@ -135,15 +147,17 @@ impl PackageView {
 }
 
 fn package_views(conn: &Connection, filter: impl Fn(&PackageRow) -> bool) -> Result<Vec<PackageView>> {
-    let published = published_index(conn)?;
+    let published = published_by_name(conn)?;
     let rows = db::latest_packages(conn)?;
     Ok(rows
         .iter()
         .filter(|r| filter(r))
         .map(|r| {
-            let published = published.get(&r.name);
+            let published = pick_published(published.get(&r.name).map(Vec::as_slice), &r.arch, None);
             PackageView {
                 name: r.name.clone(),
+                arch: r.arch.clone(),
+                origin: r.origin.clone(),
                 category: r.category.clone(),
                 version: r.version.clone(),
                 release: r.release.clone(),
@@ -162,11 +176,58 @@ fn package_views(conn: &Connection, filter: impl Fn(&PackageRow) -> bool) -> Res
         .collect())
 }
 
-fn published_index(conn: &Connection) -> Result<HashMap<String, PublishedRow>> {
-    Ok(db::published_latest_by_name(conn)?
-        .into_iter()
-        .map(|p| (p.name.clone(), p))
-        .collect())
+/// Architecture compatibility: a recipe matches its own arch, an `any`
+/// recipe is satisfied by any build, and a published `-any` artifact serves
+/// every recipe arch.
+fn arch_match(recipe_arch: &str, pub_arch: &str) -> bool {
+    recipe_arch == pub_arch || recipe_arch == "any" || pub_arch == "any"
+}
+
+/// All latest builds for one name (canonicalized arch per row).
+fn published_by_name(conn: &Connection) -> Result<HashMap<String, Vec<PublishedRow>>> {
+    let mut out: HashMap<String, Vec<PublishedRow>> = HashMap::new();
+    for mut row in db::published_latest_by_arch(conn)? {
+        row.arch = crate::model::canonical_arch(&row.arch).to_string();
+        out.entry(row.name.clone()).or_default().push(row);
+    }
+    Ok(out)
+}
+
+/// Choose the published build to compare against: architecture-compatible
+/// rows only; prefer an exact-arch build over `-any`; within that, prefer
+/// `want_same_version` when given, else the newest.
+fn pick_published<'a>(
+    rows: Option<&'a [PublishedRow]>,
+    recipe_arch: &str,
+    want_same_version: Option<&str>,
+) -> Option<&'a PublishedRow> {
+    let rows = rows?;
+    let mut compatible: Vec<&PublishedRow> =
+        rows.iter().filter(|p| arch_match(recipe_arch, &p.arch)).collect();
+    if compatible.is_empty() {
+        return None;
+    }
+    if let Some(ver) = want_same_version {
+        // Exact-arch same-version beats an any-arch same-version.
+        if let Some(hit) = compatible
+            .iter()
+            .find(|p| p.arch == recipe_arch && p.version == ver)
+        {
+            return Some(*hit);
+        }
+        if let Some(hit) = compatible.iter().find(|p| p.version == ver) {
+            return Some(*hit);
+        }
+    }
+    compatible.sort_by(|a, b| {
+        crate::status::compare_versions(
+            &format!("{}-{}", b.version, b.release),
+            &format!("{}-{}", a.version, a.release),
+        )
+        .then(b.uploaded_at.cmp(&a.uploaded_at))
+    });
+    compatible.sort_by_key(|p| p.arch != recipe_arch);
+    compatible.first().copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +253,7 @@ async fn index(State(state): State<SharedState>) -> Response {
         let views = package_views(conn, |_| true)?;
         let categories = db::categories(conn)?;
         let recent_syncs = db::recent_syncs(conn, 8)?;
-        let commit = db::meta_get(conn, "last_commit")?.unwrap_or_default();
+        let commit = commits_summary(conn)?;
         let count = |s: BuildState| views.iter().filter(|v| v.state == s).count();
         let tpl = IndexTemplate {
             total: views.len() as i64,
@@ -319,7 +380,7 @@ async fn package_detail(
             .map(|(i, v)| VersionEntry {
                 version: v.version.clone(),
                 release: v.release.clone(),
-                github_url: github_blob_url(&state.config.git_url, &v.recipe_path),
+                github_url: github_blob_url(&v.origin, &v.recipe_path),
                 latest: i == 0,
             })
             .collect();
@@ -332,9 +393,9 @@ async fn package_detail(
             }
             None => (Vec::new(), 0, None),
         };
-        let recipe_toml = std::fs::read_to_string(state.config.git_dir().join(&pkg.recipe_path))
+        let recipe_toml = std::fs::read_to_string(state.config.git_dir(&pkg.arch).join(&pkg.recipe_path))
             .unwrap_or_else(|_| "<recipe not on disk>".to_string());
-        let github_url = github_blob_url(&state.config.git_url, &pkg.recipe_path);
+        let github_url = github_blob_url(&pkg.origin, &pkg.recipe_path);
         let reverse = db::reverse_deps(conn, &name)?;
         let tpl = DetailTemplate {
             state: st,
@@ -393,6 +454,8 @@ fn orphan_row(conn: &Connection, row: &PublishedRow) -> Result<PackageRow> {
     let meta = db::published_meta(conn, &row.filename)?;
     Ok(PackageRow {
         name: row.name.clone(),
+        arch: crate::model::canonical_arch(&row.arch).to_string(),
+        origin: String::new(),
         category: "orphan".into(),
         version: meta.as_ref().map(|m| m.version.clone()).unwrap_or_else(|| row.version.clone()),
         release: meta.as_ref().map(|m| m.release.clone()).unwrap_or_else(|| row.release.clone()),
@@ -456,6 +519,55 @@ async fn status_page(State(state): State<SharedState>) -> Response {
         missing.sort_by(|a, b| a.name.cmp(&b.name));
         outdated.sort_by(|a, b| a.name.cmp(&b.name));
         let tpl = StatusTemplate { missing, outdated, ahead, built, nav: Nav::from_config(&state.config) };
+        Ok(Html(tpl.render()?).into_response())
+    })
+}
+
+/// One aggregated recipes tree as the About page presents it.
+#[derive(Serialize)]
+pub struct SourceInfo {
+    pub arch: String,
+    pub url: String,
+    /// HEAD at the last sync, short form; empty before the first sync.
+    pub commit: String,
+}
+
+/// `/about` — what this site is, which trees it aggregates, and exactly
+/// which build of recipedia is serving it.
+#[derive(Template)]
+#[template(path = "about.html")]
+pub struct AboutTemplate {
+    pub version: String,
+    pub sources: Vec<SourceInfo>,
+    pub recipe_count: i64,
+    pub published_count: i64,
+    pub last_sync: Option<SyncEntry>,
+    pub nav: Nav,
+}
+
+async fn about_page(State(state): State<SharedState>) -> Response {
+    with_conn(&state, |conn| {
+        let sources = state
+            .config
+            .git_sources
+            .iter()
+            .map(|s| {
+                let commit = db::meta_get(conn, &format!("last_commit:{}", s.arch))
+                    .ok()
+                    .flatten()
+                    .map(|full| full[..12.min(full.len())].to_string())
+                    .unwrap_or_default();
+                SourceInfo { arch: s.arch.clone(), url: s.url.clone(), commit }
+            })
+            .collect();
+        let tpl = AboutTemplate {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            sources,
+            recipe_count: db::categories(conn)?.iter().map(|c| c.count).sum(),
+            published_count: db::published_all(conn)?.len() as i64,
+            last_sync: db::recent_syncs(conn, 1)?.into_iter().next(),
+            nav: Nav::from_config(&state.config),
+        };
         Ok(Html(tpl.render()?).into_response())
     })
 }
@@ -737,11 +849,29 @@ async fn repo_file(
 #[derive(Serialize)]
 struct ApiStatusEntry {
     name: String,
+    arch: String,
     recipe_version: String,
     recipe_release: String,
     repo_version: Option<String>,
     repo_release: Option<String>,
     state: BuildState,
+}
+
+/// `amd64@<sha12> aarch64@<sha12>` style summary for the index page.
+fn commits_summary(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT key, value FROM meta WHERE key LIKE 'last_commit:%' ORDER BY key",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .iter()
+        .map(|(k, v)| format!("{}@{}", k.trim_start_matches("last_commit:"), &v[..12.min(v.len())]))
+        .collect::<Vec<_>>()
+        .join("  "))
 }
 
 async fn api_packages(State(app): State<SharedState>) -> Response {
@@ -763,19 +893,23 @@ async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<Stri
                 "name": name, "virtual": true, "providers": provider_names,
             })));
         };
-        let published_idx = published_index(conn)?;
-        let published = published_idx.get(&name);
-        let entry = ApiStatusEntry {
-            name: pkg.name.clone(),
-            state: derive(
-                &pkg.version,
-                &pkg.release,
-                published.map(|p| (p.version.as_str(), p.release.as_str())),
-            ),
-            recipe_version: pkg.version.clone(),
-            recipe_release: pkg.release.clone(),
-            repo_version: published.map(|p| p.version.clone()),
-            repo_release: published.map(|p| p.release.clone()),
+        let published_by_name = published_by_name(conn)?;
+        let entry = {
+            let published =
+                pick_published(published_by_name.get(&name).map(Vec::as_slice), &pkg.arch, None);
+            ApiStatusEntry {
+                name: pkg.name.clone(),
+                arch: pkg.arch.clone(),
+                state: derive(
+                    &pkg.version,
+                    &pkg.release,
+                    published.map(|p| (p.version.as_str(), p.release.as_str())),
+                ),
+                recipe_version: pkg.version.clone(),
+                recipe_release: pkg.release.clone(),
+                repo_version: published.map(|p| p.version.clone()),
+                repo_release: published.map(|p| p.release.clone()),
+            }
         };
         let versions: Vec<serde_json::Value> = db::package_versions(conn, &name)?
             .iter()
@@ -788,19 +922,22 @@ async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<Stri
 
 async fn api_status(State(app): State<SharedState>) -> Response {
     with_conn(&app, |conn| {
-        let published = published_index(conn)?;
+        let published = published_by_name(conn)?;
         let entries: Vec<ApiStatusEntry> = db::all_packages(conn)?
             .iter()
             .map(|r| {
-                // Pair each recipe row with a published build of the SAME
-                // version: the index keeps only the newest build per name,
-                // and comparing an old version row against it reported every
-                // superserved version as forever 'ahead'.
-                let published = published
-                    .get(&r.name)
-                    .filter(|p| p.version == r.version);
+                // Pair each recipe row with a build of a matching arch and
+                // the SAME version when one exists; comparing an old version
+                // row against a newer build reported every superseded
+                // version as forever 'ahead'.
+                let published = pick_published(
+                    published.get(&r.name).map(Vec::as_slice),
+                    &r.arch,
+                    Some(&r.version),
+                );
                 ApiStatusEntry {
                     name: r.name.clone(),
+                    arch: r.arch.clone(),
                     state: derive(
                         &r.version,
                         &r.release,
@@ -861,7 +998,7 @@ pub async fn trigger_sync(state: SharedState, trigger: &'static str) -> Response
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = worker_state.db.lock().expect("sync worker: db mutex poisoned");
-        sync::run_sync(&conn, &config.git_url, &config.git_dir(), trigger)
+        sync::run_sync(&conn, &config, trigger)
     })
     .await;
     state.syncing.store(false, Ordering::SeqCst);

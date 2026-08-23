@@ -38,7 +38,9 @@ recipedia status --state missing
 ```
 
 Configuration is environment-only: `RECIPEEDIA_LISTEN`, `RECIPEEDIA_DB`,
-`RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URL`, `RECIPEEDIA_WEBHOOK_SECRET`,
+`RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URLS` (comma-separated `arch=url`
+pairs; default aggregates recipes.amd64 + recipes.aarch64; legacy singular
+`RECIPEEDIA_GIT_URL` still works), `RECIPEEDIA_WEBHOOK_SECRET`,
 `RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_REPO_URL` (public repo domain for
 frontend file links; unset keeps same-origin `/repo/...`).
 

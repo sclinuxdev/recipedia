@@ -8,6 +8,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct Recipe {
     pub name: String,
+    /// Declared architecture, canonicalized (`x86_64` -> `amd64`). Empty when
+    /// the recipe does not declare one -- callers fall back to the tree's own
+    /// architecture.
+    pub arch: String,
     pub version: String,
     pub release: String,
     pub description: String,
@@ -21,6 +25,15 @@ pub struct Recipe {
     pub build_dependencies: Vec<Dep>,
     pub provides: Vec<String>,
     pub conffiles: Vec<String>,
+}
+
+/// Canonical architecture spelling: the legacy `x86_64` alias folds into
+/// `amd64` so recipe declarations and published artifact names always meet.
+pub fn canonical_arch(arch: &str) -> &str {
+    match arch.trim() {
+        "x86_64" => "amd64",
+        other => other.trim(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -88,6 +101,7 @@ impl Recipe {
         let mut description = table_str(&doc, "description");
         let mut license = table_str(&doc, "license");
         let mut channel = table_str(&doc, "channel");
+        let mut arch = table_str(&doc, "arch").map(|a| canonical_arch(&a).to_string());
         let mut source_url = table_str(&doc, "url");
         let mut source_sha256 = table_str(&doc, "sha256");
         let mut dependencies = table_strings(&doc, "dependencies");
@@ -105,6 +119,9 @@ impl Recipe {
             description = table_str(scope, "description").or(description);
             license = table_str(scope, "license").or(license);
             channel = table_str(scope, "channel").or(channel);
+            arch = table_str(scope, "arch")
+                .map(|a| canonical_arch(&a).to_string())
+                .or(arch);
             source_url = table_str(scope, "url").or(source_url);
             source_sha256 = table_str(scope, "sha256").or(source_sha256);
             // Arrays append across scopes, matching sage's parser.
@@ -131,6 +148,7 @@ impl Recipe {
             description: description.unwrap_or_default(),
             license: license.unwrap_or_default(),
             channel: channel.unwrap_or_else(|| "system".into()),
+            arch: arch.unwrap_or_default(),
             source_url: source_url.unwrap_or_default(),
             source_sha256: source_sha256.unwrap_or_default(),
             dependencies: dependencies.iter().map(|s| parse_dep(s)).collect(),
@@ -160,6 +178,28 @@ mod tests {
         .unwrap();
         assert_eq!(r.source_url, "https://example.com/a.tar.gz");
         assert_eq!(r.source_sha256, "777");
+    }
+
+    #[test]
+    fn arch_canonicalization() {
+        let r = Recipe::from_toml(
+            "[package]\n\
+             name = \"zlib\"\n\
+             version = \"1.3.2\"\n\
+             release = \"2\"\n\
+             arch = \"x86_64\"\n",
+        )
+        .unwrap();
+        assert_eq!(r.arch, "amd64");
+        let r = Recipe::from_toml(
+            "[package]\n\
+             name = \"shc\"\n\
+             version = \"1.0.0\"\n\
+             release = \"1\"\n\
+             arch = \"any\"\n",
+        )
+        .unwrap();
+        assert_eq!(r.arch, "any");
     }
 
     #[test]

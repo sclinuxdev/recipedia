@@ -60,12 +60,13 @@
     <a href="{{ nav.packages }}">Packages</a>
     <a href="{{ nav.status }}">Build Status</a>
     <a href="{{ nav.upload }}">Upload</a>
+    <a href="{{ nav.about }}">About</a>
     <a href="{{ nav.repo }}">Repo</a>
   </nav>
   <div style="margin-left:auto" class="muted">sclinux · recipes</div>
 </div></header>
 <main>{% block content %}{% endblock %}</main>
-<footer>Recipedia serves the sclinuxdev/recipes tree read-only; the git repository is the single source of truth.</footer>
+<footer>Recipedia {{ nav.version() }} · serves the sclinuxdev recipes trees read-only; the git repositories are the single source of truth. <a href="{{ nav.about }}">Details</a>.</footer>
 <script>
   // Timestamps are server-rendered as UTC; rewrite them in the visitor's
   // timezone once the DOM is up (the UTC text stays as the no-JS fallback).

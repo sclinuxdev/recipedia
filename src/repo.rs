@@ -158,7 +158,9 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
         description: s("description"),
         license: s("license"),
         channel: s("channel"),
-        arch: s("arch"),
+        // Legacy x86_64 manifests fold into amd64 at the door, so published
+        // state meets the recipe's canonical spelling.
+        arch: crate::model::canonical_arch(&s("arch")).to_string(),
         installed_size: i("installed_size"),
         build_compiler: s("build_compiler"),
         build_compiler_version: s("build_compiler_version"),
@@ -329,6 +331,18 @@ fn escape(value: &str) -> String {
 /// RFC3339 UTC timestamp for index.toml's updated_at.
 fn rfc3339_now() -> String {
     db::time_utc(db::now())
+}
+
+#[cfg(test)]
+mod arch_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_arch_canonicalized() {
+        let text = "[package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"2\"\narch = \"x86_64\"\n";
+        let meta = parse_manifest(text).unwrap();
+        assert_eq!(meta.arch, "amd64");
+    }
 }
 
 #[cfg(test)]

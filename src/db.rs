@@ -93,12 +93,31 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     // Databases created before P3 lack the published.meta column.
     let _ = conn.execute("ALTER TABLE published ADD COLUMN meta TEXT NOT NULL DEFAULT ''", []);
+    // Databases created before multi-arch support have a packages table
+    // without the arch/origin columns. It is a disposable cache: drop it and
+    // let the next sync rebuild the new shape.
+    let has_arch: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'arch'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_arch {
+        let _ = conn.execute("DROP TABLE IF EXISTS packages", []);
+    }
     Ok(conn)
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageRow {
     pub name: String,
+    /// Effective architecture: the declared `arch` canonicalized, falling
+    /// back to the tree's architecture when undeclared.
+    pub arch: String,
+    /// URL of the recipes tree this row was parsed from (GitHub links).
+    pub origin: String,
     pub category: String,
     pub version: String,
     pub release: String,
@@ -153,28 +172,47 @@ fn row_to_published(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublishedRow> {
 /// Replace the whole recipe cache in one shot: fill a temporary table, then
 /// swap it under the final name inside one transaction. Readers on WAL see
 /// either the old or the new world, never a half-sync.
-pub fn rebuild_packages(
-    conn: &Connection,
-    recipes: &[RecipeRecord],
-    git_commit: &str,
-) -> Result<()> {
+pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
 
     conn.execute("DROP TABLE IF EXISTS packages_new", [])?;
+    // Explicit shape: CREATE TABLE AS SELECT would copy an old table's
+    // columns verbatim and silently drop the arch/origin dimensions.
     conn.execute_batch(
-        "CREATE TABLE packages_new AS SELECT * FROM packages WHERE 0;",
+        "CREATE TABLE packages_new (
+             name            TEXT NOT NULL,
+             arch            TEXT NOT NULL,
+             origin          TEXT NOT NULL,
+             category        TEXT NOT NULL,
+             version         TEXT NOT NULL,
+             release         TEXT NOT NULL,
+             description     TEXT NOT NULL,
+             license         TEXT NOT NULL,
+             channel         TEXT NOT NULL,
+             provides        TEXT NOT NULL,
+             dependencies    TEXT NOT NULL,
+             build_deps      TEXT NOT NULL,
+             conffiles       TEXT NOT NULL,
+             source_url      TEXT NOT NULL,
+             source_sha256   TEXT NOT NULL,
+             recipe_path     TEXT NOT NULL,
+             git_commit      TEXT NOT NULL,
+             synced_at       INTEGER NOT NULL
+         );",
     )?;
     let mut stmt = conn.prepare(
-        "INSERT INTO packages_new (name, category, version, release, description, license,
+        "INSERT INTO packages_new (name, arch, origin, category, version, release, description, license,
              channel, provides, dependencies, build_deps, conffiles, source_url, source_sha256,
              recipe_path, git_commit, synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )?;
     for r in recipes {
         stmt.execute(params![
             r.recipe.name,
+            r.arch,
+            r.origin,
             r.category,
             r.recipe.version,
             r.recipe.release,
@@ -188,7 +226,7 @@ pub fn rebuild_packages(
             r.recipe.source_url,
             r.recipe.source_sha256,
             r.recipe_path,
-            git_commit,
+            r.git_commit,
             now,
         ])?;
     }
@@ -205,12 +243,18 @@ pub fn rebuild_packages(
 #[derive(Debug, Clone)]
 pub struct RecipeRecord {
     pub recipe: Recipe,
+    /// Effective architecture (declared arch, else the tree's).
+    pub arch: String,
+    /// URL of the recipes tree this record came from.
+    pub origin: String,
     pub category: String,
     pub recipe_path: String,
+    /// HEAD of the source tree at collection time.
+    pub git_commit: String,
 }
 
 const PACKAGE_COLS: &str =
-    "name, category, version, release, description, license, channel,
+    "name, arch, origin, category, version, release, description, license, channel,
      provides, dependencies, build_deps, conffiles, source_url, source_sha256, recipe_path";
 
 fn select_packages(conn: &Connection, where_clause: &str, name: Option<&str>) -> Result<Vec<PackageRow>> {
@@ -235,8 +279,13 @@ pub fn all_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
 pub fn latest_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
     let mut rows = all_packages(conn)?;
     rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.arch.cmp(&b.arch))
+    });
     rows.dedup_by(|a, b| {
-        if a.name == b.name {
+        if a.name == b.name && a.arch == b.arch {
             // `a` precedes `b`; keep whichever sorts newer under the same
             // segment ordering the build-state diff uses.
             if status_cmp(a, b) == std::cmp::Ordering::Greater {
@@ -318,21 +367,23 @@ pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
     Ok(rows)
 }
 
-/// Latest published row per package name -- latest by *version* (an old
-/// build re-uploaded later must not shadow the current one), ties broken by
-/// upload time. One row per filename survives idempotent re-uploads, so a
-/// name may carry several; this folds them to the representative one.
-pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> {
+/// Latest published row per (package name, canonical architecture). An old
+/// build re-uploaded later must not shadow the current one: latest by
+/// *version*, ties broken by upload time. Legacy `x86_64` artifacts fold
+/// into `amd64` here, so both spellings meet in one status slot.
+pub fn published_latest_by_arch(conn: &Connection) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
         "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta FROM published",
     )?;
     let all = stmt
         .query_map([], row_to_published)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut best: std::collections::HashMap<String, PublishedRow> =
+    let mut best: std::collections::HashMap<(String, String), PublishedRow> =
         std::collections::HashMap::new();
-    for row in all {
-        match best.get_mut(&row.name) {
+    for mut row in all {
+        row.arch = crate::model::canonical_arch(&row.arch).to_string();
+        let key = (row.name.clone(), row.arch.clone());
+        match best.get_mut(&key) {
             Some(cur) => {
                 let newer = crate::status::compare_versions(
                     &format!("{}-{}", row.version, row.release),
@@ -345,7 +396,7 @@ pub fn published_latest_by_name(conn: &Connection) -> Result<Vec<PublishedRow>> 
                 }
             }
             None => {
-                best.insert(row.name.clone(), row);
+                best.insert(key, row);
             }
         }
     }
@@ -758,18 +809,20 @@ fn map_package_row(
 ) -> std::result::Result<PackageRow, rusqlite::Error> {
     Ok(PackageRow {
         name: r.get(0)?,
-        category: r.get(1)?,
-        version: r.get(2)?,
-        release: r.get(3)?,
-        description: r.get(4)?,
-        license: r.get(5)?,
-        channel: r.get(6)?,
-        provides: serde_json::from_str(&r.get::<_, String>(7)?).map_err(json_err)?,
-        dependencies: serde_json::from_str(&r.get::<_, String>(8)?).map_err(json_err)?,
-        build_dependencies: serde_json::from_str(&r.get::<_, String>(9)?).map_err(json_err)?,
-        conffiles: serde_json::from_str(&r.get::<_, String>(10)?).map_err(json_err)?,
-        source_url: r.get(11)?,
-        source_sha256: r.get(12)?,
-        recipe_path: r.get(13)?,
+        arch: r.get(1)?,
+        origin: r.get(2)?,
+        category: r.get(3)?,
+        version: r.get(4)?,
+        release: r.get(5)?,
+        description: r.get(6)?,
+        license: r.get(7)?,
+        channel: r.get(8)?,
+        provides: serde_json::from_str(&r.get::<_, String>(9)?).map_err(json_err)?,
+        dependencies: serde_json::from_str(&r.get::<_, String>(10)?).map_err(json_err)?,
+        build_dependencies: serde_json::from_str(&r.get::<_, String>(11)?).map_err(json_err)?,
+        conffiles: serde_json::from_str(&r.get::<_, String>(12)?).map_err(json_err)?,
+        source_url: r.get(13)?,
+        source_sha256: r.get(14)?,
+        recipe_path: r.get(15)?,
     })
 }

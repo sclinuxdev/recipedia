@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}About{% endblock %}
+{% block content %}
+<h1>About Recipedia</h1>
+
+<p>Recipedia is the sclinux recipe &amp; repository hub: a read-only view of
+every recipes tree, cross-referenced against the published binary repository.
+Build state is derived on request — the recipes git trees and the published
+table are the only sources of truth.</p>
+
+<h2>Serving build</h2>
+<table>
+  <tr><th>Recipedia version</th><td class="mono">{{ version }}</td></tr>
+  <tr><th>Packages (recipes, all trees)</th><td class="mono">{{ recipe_count }}</td></tr>
+  <tr><th>Published artifacts</th><td class="mono">{{ published_count }}</td></tr>
+  {% if let Some(s) = last_sync %}
+  <tr><th>Last sync</th>
+      <td><span class="mono">{{ s.trigger }}</span> · <time class="ts" datetime="{{ s.when_iso() }}">{{ s.when() }}</time>
+          — {{ s.message }}</td></tr>
+  {% endif %}
+</table>
+
+<h2>Recipe sources</h2>
+<table>
+  <tr><th>Architecture</th><th>Tree</th><th>Synced HEAD</th></tr>
+  {% for s in sources %}
+  <tr>
+    <td><span class="badge st-built">{{ s.arch }}</span></td>
+    <td class="mono"><a href="{{ s.url }}">{{ s.url }}</a></td>
+    <td class="mono">{{ s.commit }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Notes</h2>
+<p class="muted">Legacy <span class="mono">x86_64</span> artifact names are canonicalized to
+<span class="mono">amd64</span>, so old and new builds meet in the same status slot. Recipes declaring
+<span class="mono">arch = "any"</span> match a published build of any architecture.</p>
+{% endblock %}

@@ -3,8 +3,9 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::config::Config;
 use crate::db::{self, RecipeRecord};
-use crate::model::Recipe;
+use crate::model::{canonical_arch, Recipe};
 
 /// Categories of the nine-way tree. When the recipes repo is restructured
 /// (P0), the first path component becomes one of these; until then the flat
@@ -20,13 +21,19 @@ pub fn update_mirror(git_url: &str, git_dir: &Path) -> Result<String> {
         run(git_dir, "git", &["fetch", "origin", "--prune"])?;
         run(git_dir, "git", &["reset", "--hard", "origin/main"])?;
     } else {
+        // One mirror directory per tree, named by its arch
+        // (<state>/git/amd64, <state>/git/aarch64).
+        let name = git_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "mirror".to_string());
         if let Some(parent) = git_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
         run(
             git_dir.parent().unwrap(),
             "git",
-            &["clone", "--depth", "1", git_url, "sclinux"],
+            &["clone", "--depth", "1", git_url, &name],
         )?;
     }
     let head = run(git_dir, "git", &["rev-parse", "HEAD"])?;
@@ -49,8 +56,15 @@ pub fn remote_head(git_url: &str) -> Result<String> {
 /// `misc`) and the nine-category `<cat>/<name>/<ver>-<rel>/recipe.toml`.
 /// A package may keep several version directories side by side; only a true
 /// collision (same name+version+release in two places) is rejected.
-pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<(String, String, String), RecipeRecord>> {
-    let mut out: BTreeMap<(String, String, String), RecipeRecord> = BTreeMap::new();
+/// Walk one tree. The status key gains an arch dimension: the effective
+/// architecture is the declared `arch` (canonicalized) when present, else the
+/// tree's own -- so an undeclared recipe in recipes.aarch64 is aarch64.
+pub fn collect_recipes(
+    git_dir: &Path,
+    source_arch: &str,
+    origin_url: &str,
+) -> Result<Vec<RecipeRecord>> {
+    let mut out: BTreeMap<(String, String, String, String), RecipeRecord> = BTreeMap::new();
     let mut stack = vec![git_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).with_context(|| dir.display().to_string())? {
@@ -62,19 +76,30 @@ pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<(String, String, Strin
                 }
                 stack.push(path);
             } else if path.file_name().is_some_and(|n| n == "recipe.toml") {
-                let record = parse_recipe_at(git_dir, &path)?;
+                let mut record = parse_recipe_at(git_dir, &path)?;
+                let eff = if record.recipe.arch.is_empty() {
+                    source_arch.to_string()
+                } else {
+                    record.recipe.arch.clone()
+                };
+                record.arch = canonical_arch(&eff).to_string();
+                record.origin = origin_url.to_string();
                 let key = (
                     record.recipe.name.clone(),
+                    record.arch.clone(),
                     record.recipe.version.clone(),
                     record.recipe.release.clone(),
                 );
                 if let Some(dup) = out.get(&key) {
                     bail!(
-                        "duplicate package '{}-{}-{}' at {} and {}",
+                        "duplicate package '{}-{}-{}-{}' at {}/{} and {}/{}",
                         record.recipe.name,
+                        record.arch,
                         record.recipe.version,
                         record.recipe.release,
+                        dup.origin,
                         dup.recipe_path,
+                        origin_url,
                         record.recipe_path
                     );
                 }
@@ -82,7 +107,7 @@ pub fn collect_recipes(git_dir: &Path) -> Result<BTreeMap<(String, String, Strin
             }
         }
     }
-    Ok(out)
+    Ok(out.into_values().collect())
 }
 
 fn parse_recipe_at(git_dir: &Path, path: &Path) -> Result<RecipeRecord> {
@@ -108,8 +133,12 @@ fn parse_recipe_at(git_dir: &Path, path: &Path) -> Result<RecipeRecord> {
         .with_context(|| format!("parsing {rel}"))?;
     Ok(RecipeRecord {
         recipe,
+        // Filled in by the caller once the source tree's arch/commit bind.
+        arch: String::new(),
+        origin: String::new(),
         category,
         recipe_path,
+        git_commit: String::new(),
     })
 }
 
@@ -129,13 +158,15 @@ fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Full sync cycle: update mirror, parse, atomically swap the cache table.
-pub fn run_sync(conn: &rusqlite::Connection, git_url: &str, git_dir: &Path, trigger: &str) -> Result<usize> {
+/// Full sync cycle across every configured tree: update each mirror, parse,
+/// then atomically swap the cache table once for the combined world.
+pub fn run_sync(conn: &rusqlite::Connection, config: &Config, trigger: &str) -> Result<usize> {
     let started = db::now();
-    let result = sync_inner(conn, git_url, git_dir);
+    let result = sync_inner(conn, config);
     match &result {
-        Ok((commit, count)) => {
-            db::log_sync(conn, trigger, commit, started, true, &format!("{count} recipes"))?;
+        Ok((commits, count)) => {
+            let summary = format!("{count} recipes from {} trees", commits.len());
+            db::log_sync(conn, trigger, &commits.join(","), started, true, &summary)?;
         }
         Err(err) => {
             db::log_sync(conn, trigger, "", started, false, &format!("{err:#}"))?;
@@ -144,11 +175,20 @@ pub fn run_sync(conn: &rusqlite::Connection, git_url: &str, git_dir: &Path, trig
     result.map(|(_, count)| count)
 }
 
-fn sync_inner(conn: &rusqlite::Connection, git_url: &str, git_dir: &Path) -> Result<(String, usize)> {
-    let commit = update_mirror(git_url, git_dir)?;
-    let recipes = collect_recipes(git_dir)?;
-    let records: Vec<RecipeRecord> = recipes.into_values().collect();
-    db::rebuild_packages(conn, &records, &commit)?;
-    db::meta_set(conn, "last_commit", &commit)?;
-    Ok((commit, records.len()))
+fn sync_inner(conn: &rusqlite::Connection, config: &Config) -> Result<(Vec<String>, usize)> {
+    let mut records: Vec<RecipeRecord> = Vec::new();
+    let mut commits = Vec::new();
+    for source in &config.git_sources {
+        let git_dir = config.git_dir(&source.arch);
+        let commit = update_mirror(&source.url, &git_dir)?;
+        let mut tree = collect_recipes(&git_dir, &source.arch, &source.url)?;
+        for r in &mut tree {
+            r.git_commit = commit.clone();
+        }
+        commits.push(format!("{}@{}", source.arch, &commit[..12.min(commit.len())]));
+        records.extend(tree);
+        db::meta_set(conn, &format!("last_commit:{}", source.arch), &commit)?;
+    }
+    db::rebuild_packages(conn, &records)?;
+    Ok((commits, records.len()))
 }
