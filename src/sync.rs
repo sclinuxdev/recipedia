@@ -176,7 +176,13 @@ pub fn run_sync(conn: &rusqlite::Connection, config: &Config, trigger: &str) -> 
 }
 
 fn sync_inner(conn: &rusqlite::Connection, config: &Config) -> Result<(Vec<String>, usize)> {
+    // Identity for cross-tree dedup: an `arch = "any"` recipe published in
+    // both trees is ONE package (same artifact serves every arch), so exact
+    // duplicates collapse. Anything differing in name/arch/version/release
+    // stays its own row.
     let mut records: Vec<RecipeRecord> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, String, String)> =
+        std::collections::HashSet::new();
     let mut commits = Vec::new();
     for source in &config.git_sources {
         let git_dir = config.git_dir(&source.arch);
@@ -186,8 +192,27 @@ fn sync_inner(conn: &rusqlite::Connection, config: &Config) -> Result<(Vec<Strin
             r.git_commit = commit.clone();
         }
         commits.push(format!("{}@{}", source.arch, &commit[..12.min(commit.len())]));
-        records.extend(tree);
         db::meta_set(conn, &format!("last_commit:{}", source.arch), &commit)?;
+        for record in tree {
+            let key = (
+                record.recipe.name.clone(),
+                record.arch.clone(),
+                record.recipe.version.clone(),
+                record.recipe.release.clone(),
+            );
+            if !seen.insert(key) {
+                if record.recipe.arch == "any" {
+                    continue; // identical any-package shipped by both trees
+                }
+                bail!(
+                    "conflicting package '{}-{}-{}' across trees",
+                    record.recipe.name,
+                    record.recipe.version,
+                    record.recipe.release
+                );
+            }
+            records.push(record);
+        }
     }
     db::rebuild_packages(conn, &records)?;
     Ok((commits, records.len()))

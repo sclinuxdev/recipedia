@@ -277,6 +277,9 @@ pub struct PackagesTemplate {
     pub q: String,
     pub category: String,
     pub state: String,
+    pub arch: String,
+    /// Distinct architectures present across all packages, for the filter.
+    pub arches: Vec<String>,
     pub total: usize,
     pub nav: Nav,
 }
@@ -288,20 +291,40 @@ async fn packages(
     let q = params.get("q").cloned().unwrap_or_default();
     let category = params.get("category").cloned().unwrap_or_default();
     let state_filter = params.get("state").cloned().unwrap_or_default();
+    let arch_filter = params.get("arch").cloned().unwrap_or_default();
     with_conn(&app, |conn| {
         let ql = q.to_lowercase();
         // State filtering runs on derived views, so it happens after mapping.
         let mut rows: Vec<PackageView> = package_views(conn, |r| {
-            q.is_empty()
-                || r.name.to_lowercase().contains(&ql)
-                || r.description.to_lowercase().contains(&ql)
+            (arch_filter.is_empty() || r.arch == arch_filter)
+                && (q.is_empty()
+                    || r.name.to_lowercase().contains(&ql)
+                    || r.description.to_lowercase().contains(&ql))
         })?;
         rows.retain(|v| {
             (category.is_empty() || v.category == category)
                 && (state_filter.is_empty() || v.state.label() == state_filter)
         });
         let total = rows.len();
-        let tpl = PackagesTemplate { rows, q, category, state: state_filter, total, nav: Nav::from_config(&app.config) };
+        let arches: Vec<String> = {
+            let mut a: Vec<String> = db::latest_packages(conn)?
+                .iter()
+                .map(|r| r.arch.clone())
+                .collect();
+            a.sort();
+            a.dedup();
+            a
+        };
+        let tpl = PackagesTemplate {
+            rows,
+            q,
+            category,
+            state: state_filter,
+            arch: arch_filter.clone(),
+            arches,
+            total,
+            nav: Nav::from_config(&app.config),
+        };
         Ok(Html(tpl.render()?).into_response())
     })
 }
@@ -318,6 +341,9 @@ pub struct VersionEntry {
 #[derive(Template)]
 #[template(path = "package_detail.html")]
 pub struct DetailTemplate {
+    /// Other architectures this package also exists for, linking to their
+    /// own view (`("aarch64", "/package/zlib?arch=aarch64")`).
+    pub other_arches: Vec<(String, String)>,
     pub pkg: PackageRow,
     pub state: BuildState,
     /// Every published build of this package, newest upload first.
@@ -339,10 +365,39 @@ pub struct DetailTemplate {
 async fn package_detail(
     State(state): State<SharedState>,
     AxPath(name): AxPath<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     with_conn(&state, |conn| {
-        let versions = db::package_versions(conn, &name)?;
-        let published = db::published_for_name(conn, &name)?;
+        let want_arch = params
+            .get("arch")
+            .map(|a| crate::model::canonical_arch(a).to_string());
+        let all_versions = db::package_versions(conn, &name)?;
+        // One logical package can exist for several architectures; each arch
+        // is its own recipe/build identity with its own page view.
+        let mut arches: Vec<String> = all_versions.iter().map(|v| v.arch.clone()).collect();
+        arches.sort();
+        arches.dedup();
+        // Requested arch wins; otherwise the tree with the newest recipe.
+        let selected_arch = want_arch
+            .clone()
+            .filter(|a| arches.contains(a))
+            .or_else(|| arches.first().cloned());
+        let versions: Vec<PackageRow> = match &selected_arch {
+            Some(arch) => all_versions.iter().filter(|v| &v.arch == arch).cloned().collect(),
+            None => all_versions,
+        };
+        let published_all = db::published_for_name(conn, &name)?;
+        let published: Vec<PublishedRow> = match &selected_arch {
+            Some(arch) => published_all
+                .iter()
+                .filter(|p| {
+                    let pa = crate::model::canonical_arch(&p.arch);
+                    pa == arch || pa == "any" || arch == "any"
+                })
+                .cloned()
+                .collect(),
+            None => published_all,
+        };
         let pkg = match versions.first().cloned() {
             Some(pkg) => pkg,
             None => {
@@ -397,7 +452,14 @@ async fn package_detail(
             .unwrap_or_else(|_| "<recipe not on disk>".to_string());
         let github_url = github_blob_url(&pkg.origin, &pkg.recipe_path);
         let reverse = db::reverse_deps(conn, &name)?;
+        let base = format!("/package/{}", name);
+        let other_arches = arches
+            .iter()
+            .filter(|a| Some(a.to_string()) != selected_arch)
+            .map(|a| (a.clone(), format!("{}?arch={}", base, a)))
+            .collect();
         let tpl = DetailTemplate {
+            other_arches,
             state: st,
             published,
             versions: ladder,
@@ -419,6 +481,7 @@ async fn package_detail(
 #[derive(Debug, Clone)]
 pub struct ProviderView {
     pub name: String,
+    pub arch: String,
     pub state: BuildState,
     pub repo_version: String,
 }
@@ -443,7 +506,12 @@ fn render_virtual(
         provider_names.iter().map(String::as_str).collect();
     let providers = package_views(conn, |r| wanted.contains(r.name.as_str()))?
         .into_iter()
-        .map(|v| ProviderView { name: v.name, state: v.state, repo_version: v.repo_version })
+        .map(|v| ProviderView {
+            name: v.name,
+            arch: v.arch.clone(),
+            state: v.state,
+            repo_version: v.repo_version,
+        })
         .collect();
     Ok(Html(VirtualTemplate { name: name.to_string(), providers, nav }.render()?).into_response())
 }
@@ -479,6 +547,10 @@ pub struct CategoryTemplate {
     pub q: String,
     pub category: String,
     pub state: String,
+    /// Unused by category pages (the filter form only shows on /packages);
+    /// present because both share one template file.
+    pub arch: String,
+    pub arches: Vec<String>,
     pub total: usize,
     pub nav: Nav,
 }
@@ -492,6 +564,8 @@ async fn category(State(state): State<SharedState>, AxPath(cat): AxPath<String>)
             q: String::new(),
             category: cat,
             state: String::new(),
+            arch: String::new(),
+            arches: Vec::new(),
             total,
             nav: Nav::from_config(&state.config),
         };
@@ -506,19 +580,34 @@ pub struct StatusTemplate {
     pub outdated: Vec<PackageView>,
     pub ahead: Vec<PackageView>,
     pub built: usize,
+    pub arch: String,
+    /// Distinct architectures present across all packages, for the filter.
+    pub arches: Vec<String>,
     pub nav: Nav,
 }
 
-async fn status_page(State(state): State<SharedState>) -> Response {
+async fn status_page(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let arch_filter = params.get("arch").cloned().unwrap_or_default();
     with_conn(&state, |conn| {
-        let views = package_views(conn, |_| true)?;
+        let mut arches: Vec<String> = db::latest_packages(conn)?
+            .iter()
+            .map(|r| r.arch.clone())
+            .collect();
+        arches.sort();
+        arches.dedup();
+        let views = package_views(conn, |r| {
+            arch_filter.is_empty() || r.arch == arch_filter
+        })?;
         let mut missing: Vec<_> = views.iter().filter(|v| v.state == BuildState::Missing).cloned().collect();
         let mut outdated: Vec<_> = views.iter().filter(|v| v.state == BuildState::Outdated).cloned().collect();
         let ahead: Vec<_> = views.iter().filter(|v| v.state == BuildState::Ahead).cloned().collect();
         let built = views.iter().filter(|v| v.state == BuildState::Built).count();
         missing.sort_by(|a, b| a.name.cmp(&b.name));
         outdated.sort_by(|a, b| a.name.cmp(&b.name));
-        let tpl = StatusTemplate { missing, outdated, ahead, built, nav: Nav::from_config(&state.config) };
+        let tpl = StatusTemplate { missing, outdated, ahead, built, arch: arch_filter, arches, nav: Nav::from_config(&state.config) };
         Ok(Html(tpl.render()?).into_response())
     })
 }

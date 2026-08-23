@@ -3,12 +3,22 @@
 {% block content %}
 <h1>Build Status <span class="muted">({{ built }} built)</span></h1>
 
+<form class="filters" method="get" action="/status">
+  <select name="arch">
+    <option value="">all architectures</option>
+    {% for a in arches %}
+    <option value="{{ a }}" {% if a.as_str() == arch.as_str() %}selected{% endif %}>{{ a }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">Filter</button>
+</form>
+
 <h2>Missing — awaiting first build ({{ missing.len() }})</h2>
 <table>
   <tr><th>Name</th><th>Arch</th><th>Version</th><th>Category</th><th>Description</th></tr>
   {% for r in missing %}
   <tr>
-    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono"><a href="/package/{{ r.name }}?arch={{ r.arch }}">{{ r.name }}</a></td>
     <td><span class="badge st-built">{{ r.arch }}</span></td>
     <td class="mono">{{ r.version }}-{{ r.release }}</td>
     <td>{{ r.category }}</td>
@@ -22,7 +32,7 @@
   <tr><th>Name</th><th>Arch</th><th>Recipe</th><th>In repo</th><th>Description</th></tr>
   {% for r in outdated %}
   <tr>
-    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono"><a href="/package/{{ r.name }}?arch={{ r.arch }}">{{ r.name }}</a></td>
     <td><span class="badge st-built">{{ r.arch }}</span></td>
     <td class="mono">{{ r.version }}-{{ r.release }}</td>
     <td class="mono">{{ r.repo_version }}</td>
@@ -36,7 +46,7 @@
   <tr><th>Name</th><th>Arch</th><th>Recipe</th><th>Description</th></tr>
   {% for r in ahead %}
   <tr>
-    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono"><a href="/package/{{ r.name }}?arch={{ r.arch }}">{{ r.name }}</a></td>
     <td><span class="badge st-built">{{ r.arch }}</span></td>
     <td class="mono">{{ r.version }}-{{ r.release }}</td>
     <td class="muted">{{ r.description }}</td>

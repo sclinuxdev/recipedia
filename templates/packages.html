@@ -26,15 +26,22 @@
     <option value="built">built</option>
     <option value="ahead">ahead</option>
   </select>
+  <select name="arch">
+    <option value="">all architectures</option>
+    {% for a in arches %}
+    <option value="{{ a }}" {% if a.as_str() == arch.as_str() %}selected{% endif %}>{{ a }}</option>
+    {% endfor %}
+  </select>
   <button type="submit">Filter</button>
 </form>
 {% endif %}
 
 <table>
-  <tr><th>Name</th><th>Version</th><th>Category</th><th>State</th><th>Published</th><th>Description</th></tr>
+  <tr><th>Name</th><th>Arch</th><th>Version</th><th>Category</th><th>State</th><th>Published</th><th>Description</th></tr>
   {% for r in rows %}
   <tr>
-    <td class="mono"><a href="/package/{{ r.name }}">{{ r.name }}</a></td>
+    <td class="mono"><a href="/package/{{ r.name }}?arch={{ r.arch }}">{{ r.name }}</a></td>
+    <td><span class="badge st-built">{{ r.arch }}</span></td>
     <td class="mono">{{ r.version }}-{{ r.release }}
       {% if r.repo_differs() %}
         <span class="muted">→ {{ r.repo_version }}</span>

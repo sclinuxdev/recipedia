@@ -1,13 +1,22 @@
 {% extends "base.html" %}
 {% block title %}{{ pkg.name }}{% endblock %}
 {% block content %}
-<h1><span class="mono">{{ pkg.name }}</span> <span class="mono muted">{{ pkg.version }}-{{ pkg.release }}</span>
+<h1><span class="mono">{{ pkg.name }}</span>
+    <span class="badge st-built">{{ pkg.arch }}</span>
+    <span class="mono muted">{{ pkg.version }}-{{ pkg.release }}</span>
     <span class="badge st-{{ state.label() }}">{{ state.label() }}</span></h1>
+
+{% if !other_arches.is_empty() %}
+<p>This package also exists for:
+  {% for a in other_arches %}<a class="mono" href="{{ a.1 }}">{{ a.0 }}</a>{{ " " }}{% endfor %}
+</p>
+{% endif %}
 
 <p>{{ pkg.description }}</p>
 
 <h2>Details</h2>
 <table>
+  <tr><th>Architecture</th><td><span class="badge st-built">{{ pkg.arch }}</span></td></tr>
   <tr><th>Recipe version</th><td class="mono">{{ pkg.version }}-{{ pkg.release }}</td></tr>
   <tr><th>Category</th><td><a href="/category/{{ pkg.category }}">{{ pkg.category }}</a></td></tr>
   <tr><th>Channel</th><td class="mono">{{ pkg.channel }}</td></tr>
@@ -23,10 +32,12 @@
 <h2>Published builds</h2>
 <p class="muted">The compiler column reflects the stamps recorded by <code>sage build</code> — it appears only when the build produced compilation evidence, so data-only packages show none.</p>
 <table>
-  <tr><th>Version</th><th>File</th><th>Size</th><th>Published</th><th>Built with</th></tr>
+  <tr><th>Version</th><th>Arch</th><th>Builder</th><th>File</th><th>Size</th><th>Published</th><th>Built with</th></tr>
   {% for p in published %}
   <tr>
     <td class="mono">{{ p.version }}-{{ p.release }}</td>
+    <td><span class="badge st-built">{{ p.arch }}</span></td>
+    <td class="mono muted">{{ p.builder }}</td>
     <td class="mono"><a href="{{ nav.repo }}/{{ p.filename }}">{{ p.filename }}</a></td>
     <td class="mono muted">{{ p.size_mib() }} MiB</td>
     <td class="mono muted"><time class="ts" datetime="{{ p.built_iso() }}">{{ p.built_at() }}</time></td>

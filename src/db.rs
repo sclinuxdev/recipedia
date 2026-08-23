@@ -142,6 +142,8 @@ pub struct PublishedRow {
     pub arch: String,
     pub size: i64,
     pub sha256: String,
+    /// Who published this build (token label from the upload).
+    pub builder: String,
     pub uploaded_at: i64,
     /// Manifest meta stored at publish time; carries the build-provenance
     /// stamps (compiler, flags) when the builder recorded any.
@@ -160,6 +162,7 @@ fn row_to_published(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublishedRow> {
         arch: r.get(4)?,
         size: r.get(5)?,
         sha256: r.get(6)?,
+        builder: r.get(9)?,
         uploaded_at: r.get(7)?,
         meta: if meta_json.is_empty() {
             None
@@ -408,7 +411,7 @@ pub fn published_latest_by_arch(conn: &Connection) -> Result<Vec<PublishedRow>> 
 /// Every published archive, newest upload first -- the repo file browser.
 pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder
          FROM published ORDER BY uploaded_at DESC",
     )?;
     let rows = stmt
@@ -421,7 +424,7 @@ pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
 /// version ladder of what actually landed in the repository.
 pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder
          FROM published WHERE name = ?1 ORDER BY uploaded_at DESC",
     )?;
     let rows = stmt

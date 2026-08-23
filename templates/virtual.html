@@ -7,10 +7,11 @@
 entry. These packages supply it:</p>
 
 <table>
-  <tr><th>Provider</th><th>Version</th><th>State</th></tr>
+  <tr><th>Provider</th><th>Arch</th><th>Version</th><th>State</th></tr>
   {% for p in providers %}
   <tr>
-    <td class="mono"><a href="/package/{{ p.name }}">{{ p.name }}</a></td>
+    <td class="mono"><a href="/package/{{ p.name }}?arch={{ p.arch }}">{{ p.name }}</a></td>
+    <td><span class="badge st-built">{{ p.arch }}</span></td>
     <td class="mono">{{ p.repo_version }}</td>
     <td><span class="badge st-{{ p.state.label() }}">{{ p.state.label() }}</span></td>
   </tr>
