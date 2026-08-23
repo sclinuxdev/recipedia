@@ -16,6 +16,8 @@ services:
     environment:
       # GitHub webhook 密钥(可选, 不设则只靠轮询同步)
       RECIPEEDIA_WEBHOOK_SECRET: ${RECIPEEDIA_WEBHOOK_SECRET:-}
+      # 多 recipes 树聚合(默认即 amd64 + aarch64, 可不设)
+      RECIPEEDIA_GIT_URLS: ${RECIPEEDIA_GIT_URLS:-amd64=https://github.com/sclinuxdev/recipes.amd64,aarch64=https://github.com/sclinuxdev/recipes.aarch64}
       # 两个 recipes 树都聚合; 用 RECIPEEDIA_GIT_URLS 覆盖(逗号分隔 arch=url)
       RECIPEEDIA_GIT_URLS: ${RECIPEEDIA_GIT_URLS:-amd64=https://github.com/sclinuxdev/recipes.amd64,aarch64=https://github.com/sclinuxdev/recipes.aarch64}
       RECIPEEDIA_POLL_SECS: ${RECIPEEDIA_POLL_SECS:-600}
