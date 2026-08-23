@@ -376,7 +376,7 @@ pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
 /// into `amd64` here, so both spellings meet in one status slot.
 pub fn published_latest_by_arch(conn: &Connection) -> Result<Vec<PublishedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta FROM published",
+        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder FROM published",
     )?;
     let all = stmt
         .query_map([], row_to_published)?
