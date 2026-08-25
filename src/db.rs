@@ -669,7 +669,7 @@ impl SyncEntry {
 
 /// One renderable build-flag line of the provenance block.
 pub struct FlagLine {
-    pub label: &'static str,
+    pub label: String,
     pub value: String,
 }
 
@@ -695,16 +695,32 @@ impl PublishedRow {
             !(m.build_compiler.is_empty()
                 && m.build_cflags.is_empty()
                 && m.build_cxxflags.is_empty()
-                && m.build_ldflags.is_empty())
+                && m.build_ldflags.is_empty()
+                && m.build_rustflags.is_empty()
+                && m.build_producers.is_empty()
+                && m.build_flag_passthrough.is_empty())
         })
     }
-    /// "clang 22.1.8" style stamp; empty when the build recorded no compiler.
-    /// Sage's paired form ("clang: 22.1.8, gcc: 15.3.0" — one version per
-    /// producer, crt traces included) renders as "clang 22.1.8 · gcc 15.3.0".
+    /// Producer stamp, artifact-verified first: "clang 22.1.8 · lld 22.1.8"
+    /// straight from [[build_producers]] when the manifest carries them;
+    /// falls back to the legacy injected-compiler pair ("clang: 22.1.8,
+    /// gcc: 15.3.0" renders as "clang 22.1.8 · gcc 15.3.0"). Empty when the
+    /// build recorded neither.
     pub fn compiler_line(&self) -> String {
         let Some(m) = &self.meta else {
             return String::new();
         };
+        if !m.build_producers.is_empty() {
+            return m
+                .build_producers
+                .iter()
+                .map(|p| {
+                    let v = p.versions.first().map(String::as_str).unwrap_or("?");
+                    format!("{} {v}", p.name)
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        }
         if m.build_compiler.is_empty() {
             return String::new();
         }
@@ -730,14 +746,51 @@ impl PublishedRow {
             ("CFLAGS", &m.build_cflags),
             ("CXXFLAGS", &m.build_cxxflags),
             ("LDFLAGS", &m.build_ldflags),
+            ("RUSTFLAGS", &m.build_rustflags),
         ]
         .into_iter()
         .filter(|(_, v)| !v.is_empty())
         .map(|(label, value)| FlagLine {
-            label,
+            label: label.to_string(),
             value: value.clone(),
         })
         .collect()
+    }
+    /// Per-producer switches verified from DWARF (one line per producer
+    /// that carries flags); empty when no producer recorded switches.
+    pub fn producer_flag_lines(&self) -> Vec<FlagLine> {
+        let Some(m) = &self.meta else {
+            return Vec::new();
+        };
+        let mut out: Vec<FlagLine> = Vec::new();
+        for p in &m.build_producers {
+            if p.flags.is_empty() || p.name.is_empty() {
+                continue;
+            }
+            out.push(FlagLine {
+                label: if p.versions.is_empty() {
+                    p.name.clone()
+                } else {
+                    format!("{} {}", p.name, p.versions[0])
+                },
+                value: p.flags.clone(),
+            });
+        }
+        out
+    }
+    /// Env channels the recipe forwarded flags through ("KCFLAGS"); empty
+    /// when none annotated.
+    pub fn passthrough_channels(&self) -> &[String] {
+        self.meta
+            .as_ref()
+            .map(|m| m.build_flag_passthrough.as_slice())
+            .unwrap_or(&[])
+    }
+    /// True when the manifest ships a universal service definition.
+    pub fn is_daemon(&self) -> bool {
+        self.meta
+            .as_ref()
+            .is_some_and(|m| !m.service_toml.is_empty())
     }
 }
 

@@ -3,6 +3,7 @@
 {% block content %}
 <h1><span class="mono">{{ pkg.name }}</span>
     <span class="badge st-built">{{ pkg.arch }}</span>
+    {% if p_daemon %}<span class="badge st-ahead">daemon</span>{% endif %}
     <span class="mono muted">{{ pkg.version }}-{{ pkg.release }}</span>
     <span class="badge st-{{ state.label() }}">{{ state.label() }}</span></h1>
 
@@ -44,11 +45,17 @@
     {% if p.has_build_info() %}
     <td class="mono">
       {% if !p.compiler_line().is_empty() %}{{ p.compiler_line() }}{% endif %}
-      {% if !p.flag_lines().is_empty() %}
+      {% if !p.flag_lines().is_empty() || !p.producer_flag_lines().is_empty() %}
       <details><summary>flags</summary>
+        {% for f in p.producer_flag_lines() %}
+        <div><span class="muted">verified</span> {{ f.label }} <span class="mono">{{ f.value }}</span></div>
+        {% endfor %}
         {% for f in p.flag_lines() %}
         <div>{{ f.label }} <span class="mono">{{ f.value }}</span></div>
         {% endfor %}
+        {% if !p.passthrough_channels().is_empty() %}
+        <div class="muted">passthrough: {% for c in p.passthrough_channels() %}<span class="mono">{{ c }}</span>{{ " " }}{% endfor %}</div>
+        {% endif %}
       </details>
       {% endif %}
     </td>

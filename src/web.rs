@@ -356,6 +356,8 @@ pub struct DetailTemplate {
     pub github_url: String,
     pub files: Vec<db::FileLine>,
     pub files_total: usize,
+    /// Representative build ships a universal service definition.
+    pub p_daemon: bool,
     pub has_log: bool,
     pub log_content: String,
     pub log_builder: String,
@@ -458,10 +460,12 @@ async fn package_detail(
             .filter(|a| Some(a.to_string()) != selected_arch)
             .map(|a| (a.clone(), format!("{}?arch={}", base, a)))
             .collect();
+        let p_daemon = best_pub.is_some_and(|r| r.is_daemon());
         let tpl = DetailTemplate {
             other_arches,
             state: st,
             published,
+            p_daemon,
             versions: ladder,
             files,
             files_total,
