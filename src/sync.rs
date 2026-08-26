@@ -61,10 +61,30 @@ pub fn remote_head(git_url: &str) -> Result<String> {
 fn changed_arches(git_dir: &Path, previous: Option<&str>, current: &str) -> Result<Vec<String>> {
     let paths = match previous {
         Some(old) if old == current => String::new(),
-        Some(old) => run(git_dir, "git", &["diff", "--name-only", old, current])?,
+        Some(old) if commit_exists(git_dir, old)? => {
+            run(git_dir, "git", &["diff", "--name-only", old, current])?
+        }
+        // The SQLite cache can outlive a replaced or re-cloned shallow Git
+        // mirror. Without the old object an incremental diff is impossible;
+        // treat the current tree as a full change and let the atomic recipe
+        // rebuild restore a valid baseline instead of failing forever.
+        Some(_) => run(git_dir, "git", &["ls-tree", "-r", "--name-only", current])?,
         None => run(git_dir, "git", &["ls-tree", "-r", "--name-only", current])?,
     };
     Ok(arches_from_paths(&paths))
+}
+
+fn commit_exists(git_dir: &Path, commit: &str) -> Result<bool> {
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(false);
+    }
+    let object = format!("{commit}^{{commit}}");
+    let output = std::process::Command::new("git")
+        .args(["cat-file", "-e", &object])
+        .current_dir(git_dir)
+        .output()
+        .context("checking previous Git commit")?;
+    Ok(output.status.success())
 }
 
 fn arches_from_paths(paths: &str) -> Vec<String> {
@@ -264,6 +284,51 @@ mod tests {
             ),
             ["aarch64", "amd64", "any"]
         );
+    }
+
+    #[test]
+    fn missing_previous_commit_falls_back_to_the_full_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "recipedia-missing-sync-baseline-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let recipe = root.join("devel/demo/amd64/demo-1.0.0-1/recipe.toml");
+        std::fs::create_dir_all(recipe.parent().unwrap()).unwrap();
+        std::fs::write(&recipe, "name = \"demo\"\n").unwrap();
+        run(&root, "git", &["init"]).unwrap();
+        run(&root, "git", &["add", "."]).unwrap();
+        run(
+            &root,
+            "git",
+            &[
+                "-c",
+                "user.name=Recipedia Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let current = run(&root, "git", &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            changed_arches(
+                &root,
+                Some("5e0cee6a8836299985d3c8022701a6c7f9d7a921"),
+                &current,
+            )
+            .unwrap(),
+            ["amd64"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

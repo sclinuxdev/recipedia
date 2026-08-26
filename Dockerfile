@@ -1,7 +1,7 @@
 # Runtime-only image: pulls the released binaries instead of compiling.
-# Pin with --build-arg RECIPEEDIA_VERSION=0.1.4 (no leading v in the default
+# Pin with --build-arg RECIPEEDIA_VERSION=0.1.5 (no leading v in the default
 # keeps older compose files working; the tag always carries it).
-ARG RECIPEEDIA_VERSION=0.1.4
+ARG RECIPEEDIA_VERSION=0.1.5
 # ubuntu 24.04: its glibc 2.39 matches what the release binaries were
 # compiled against (bookworm's 2.36 is too old).
 FROM ubuntu:24.04
