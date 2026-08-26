@@ -40,8 +40,9 @@ recipedia status --state missing
 Configuration is environment-only: `RECIPEEDIA_LISTEN`, `RECIPEEDIA_DB`,
 `RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URL` (one canonical repository;
 defaults to `https://github.com/sclinuxdev/recipes`), `RECIPEEDIA_WEBHOOK_SECRET`,
-`RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_REPO_URL` (public repo domain for
-frontend file links; unset keeps same-origin `/repo/...`).
+`RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_FRONTEND_URL` (public frontend origin),
+and `RECIPEEDIA_REPO_URL` (public repo domain for file links; unset keeps
+same-origin `/repo/...`).
 
 The canonical tree layout is
 `<category>/<name>/<arch>/<name>-<version>-<release>/recipe.toml`. A sync diffs
@@ -55,9 +56,9 @@ matching x86_64 glibc binaries from GitHub Releases instead of compiling on
 the server. Build it only after that release exists:
 
 ```sh
-docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.3 \
-  -t recipedia:0.1.3 -t recipedia:latest \
-  https://github.com/sclinuxdev/recipedia.git#v0.1.3
+docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.4 \
+  -t recipedia:0.1.4 -t recipedia:latest \
+  https://github.com/sclinuxdev/recipedia.git#v0.1.4
 install -d -m 0750 /srv/recipedia
 RECIPEEDIA_DATA_DIR=/srv/recipedia docker compose up -d --force-recreate
 docker exec recipedia recipedia-server token <label>
@@ -73,7 +74,7 @@ the split domains shown in `compose.yaml`, proxy the repository domain to
 webhook payload URL as `https://<frontend>/api/webhook/github`, content type
 `application/json`, and use the same secret as `RECIPEEDIA_WEBHOOK_SECRET`.
 
-To upgrade, replace `0.1.3` with the new release in the build command, retag
+To upgrade, replace `0.1.4` with the new release in the build command, retag
 `recipedia:latest`, and run `docker compose up -d --force-recreate` again. The
 mounted data directory is reused and the disposable recipe cache is rebuilt
 from the canonical git source.
