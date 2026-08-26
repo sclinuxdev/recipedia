@@ -19,6 +19,20 @@ pub struct ManagedBuildTool {
     pub executable: String,
     pub family: String,
     pub version: String,
+    /// Non-empty flag channels Sage actually configured for this archive.
+    /// Stored as `ENV=value`; never inferred from the resulting binaries.
+    #[serde(default)]
+    pub parameters: Vec<String>,
+}
+
+fn valid_managed_parameter(parameter: &str) -> bool {
+    let Some((name, value)) = parameter.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !value.is_empty()
 }
 
 /// The `[package]` section of a package's `.METADATA/manifest.toml` — the
@@ -174,11 +188,26 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
                             .unwrap_or_default()
                             .to_string()
                     };
+                    let parameters = match tool.get("parameters") {
+                        None => Vec::new(),
+                        Some(value) => value
+                            .as_array()
+                            .context("managed_build_tools parameters must be an array")?
+                            .iter()
+                            .map(|parameter| {
+                                parameter
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .context("managed_build_tools parameters must be strings")
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    };
                     let observed = ManagedBuildTool {
                         role: value("role"),
                         executable: value("executable"),
                         family: value("family"),
                         version: value("version"),
+                        parameters,
                     };
                     let version_argument = value("version_argument");
                     let known = match observed.role.as_str() {
@@ -191,6 +220,16 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
                         || observed.executable.is_empty()
                         || observed.version.is_empty()
                         || version_argument != "--version"
+                        || observed
+                            .parameters
+                            .iter()
+                            .any(|parameter| !valid_managed_parameter(parameter))
+                        || observed
+                            .parameters
+                            .iter()
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                            != observed.parameters.len()
                     {
                         bail!("invalid managed_build_tools observation");
                     }
@@ -342,6 +381,9 @@ pub fn regenerate_index(conn: &rusqlite::Connection, cfg: &Config) -> Result<()>
                 w(&mut out, "version", &tool.version),
                 w(&mut out, "version_argument", "--version"),
             );
+            if !tool.parameters.is_empty() {
+                push_array(&mut out, "parameters", &tool.parameters);
+            }
         }
         out.push('\n');
     }
@@ -445,6 +487,7 @@ executable = "/opt/toolchains/bin/clang"
 family = "clang"
 version = "22.1.8"
 version_argument = "--version"
+parameters = ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
 "#,
         )
         .unwrap();
@@ -454,6 +497,10 @@ version_argument = "--version"
             "/opt/toolchains/bin/clang"
         );
         assert_eq!(meta.managed_build_tools[0].version, "22.1.8");
+        assert_eq!(
+            meta.managed_build_tools[0].parameters,
+            ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
+        );
 
         let prebuilt =
             parse_manifest("[package]\nname = \"rust-bin\"\nversion = \"1.90\"\nrelease = \"1\"\n")

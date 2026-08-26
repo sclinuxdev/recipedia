@@ -52,14 +52,22 @@
       <details>
         <summary>{{ p.managed_build_tools().len() }} observed</summary>
         <table>
-          <tr><th>Role</th><th>Executable</th><th>Family</th><th>Version</th><th>Source</th></tr>
+          <tr><th>Role</th><th>Executable</th><th>Family</th><th>Version</th><th>Sage-configured parameters</th></tr>
           {% for tool in p.managed_build_tools() %}
           <tr>
             <td class="mono">{{ tool.role }}</td>
             <td class="mono">{{ tool.executable }}</td>
             <td class="mono">{{ tool.family }}</td>
             <td class="mono">{{ tool.version }}</td>
-            <td class="mono">{{ tool.executable }} --version</td>
+            <td>
+              {% if tool.parameters.is_empty() %}
+              <span class="muted">—</span>
+              {% else %}
+              {% for parameter in tool.parameters %}
+              <div class="mono">{{ parameter }}</div>
+              {% endfor %}
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </table>

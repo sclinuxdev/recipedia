@@ -872,6 +872,7 @@ mod tests {
                 executable: "clang".into(),
                 family: "clang".into(),
                 version: "22.1.8".into(),
+                parameters: vec!["CFLAGS=-O3".into()],
             }],
         );
         let gcc = published_with_tools(
@@ -881,13 +882,16 @@ mod tests {
                 executable: "gcc".into(),
                 family: "gcc".into(),
                 version: "16.2.0".into(),
+                parameters: vec!["CFLAGS=-O2".into()],
             }],
         );
         let prebuilt =
             published_with_tools("same-package-1.0-1-amd64-prebuilt.pkg.tar.zst", Vec::new());
 
         assert_eq!(clang.managed_build_tools()[0].executable, "clang");
+        assert_eq!(clang.managed_build_tools()[0].parameters, ["CFLAGS=-O3"]);
         assert_eq!(gcc.managed_build_tools()[0].executable, "gcc");
+        assert_eq!(gcc.managed_build_tools()[0].parameters, ["CFLAGS=-O2"]);
         assert!(prebuilt.managed_build_tools().is_empty());
     }
 
