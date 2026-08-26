@@ -726,6 +726,15 @@ impl PublishedRow {
             .as_ref()
             .is_some_and(|m| !m.service_toml.is_empty())
     }
+    /// Build tools observed for this exact uploaded archive. This must never
+    /// be lifted to package/recipe scope: two uploads of the same version may
+    /// have been built with different Sage-managed toolchains.
+    pub fn managed_build_tools(&self) -> &[crate::repo::ManagedBuildTool] {
+        self.meta
+            .as_ref()
+            .map(|m| m.managed_build_tools.as_slice())
+            .unwrap_or_default()
+    }
 }
 
 /// Unix seconds → `YYYY-MM-DD HH:MM:SSZ` UTC via civil-from-days
@@ -820,6 +829,67 @@ fn map_package_row(r: &rusqlite::Row<'_>) -> std::result::Result<PackageRow, rus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published_with_tools(
+        filename: &str,
+        tools: Vec<crate::repo::ManagedBuildTool>,
+    ) -> PublishedRow {
+        PublishedRow {
+            filename: filename.into(),
+            name: "same-package".into(),
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "amd64".into(),
+            size: 1,
+            sha256: String::new(),
+            builder: "test".into(),
+            uploaded_at: 0,
+            meta: Some(crate::repo::ManifestMeta {
+                name: "same-package".into(),
+                version: "1.0".into(),
+                release: "1".into(),
+                epoch: 0,
+                description: String::new(),
+                license: String::new(),
+                channel: "system".into(),
+                arch: "amd64".into(),
+                installed_size: 1,
+                service_toml: String::new(),
+                dependencies: Vec::new(),
+                provides: Vec::new(),
+                conffiles: Vec::new(),
+                managed_build_tools: tools,
+            }),
+        }
+    }
+
+    #[test]
+    fn managed_build_tools_remain_scoped_to_each_uploaded_archive() {
+        let clang = published_with_tools(
+            "same-package-1.0-1-amd64-clang.pkg.tar.zst",
+            vec![crate::repo::ManagedBuildTool {
+                role: "cc".into(),
+                executable: "clang".into(),
+                family: "clang".into(),
+                version: "22.1.8".into(),
+            }],
+        );
+        let gcc = published_with_tools(
+            "same-package-1.0-1-amd64-gcc.pkg.tar.zst",
+            vec![crate::repo::ManagedBuildTool {
+                role: "cc".into(),
+                executable: "gcc".into(),
+                family: "gcc".into(),
+                version: "16.2.0".into(),
+            }],
+        );
+        let prebuilt =
+            published_with_tools("same-package-1.0-1-amd64-prebuilt.pkg.tar.zst", Vec::new());
+
+        assert_eq!(clang.managed_build_tools()[0].executable, "clang");
+        assert_eq!(gcc.managed_build_tools()[0].executable, "gcc");
+        assert!(prebuilt.managed_build_tools().is_empty());
+    }
 
     #[test]
     fn upstream_metadata_survives_recipe_cache_rebuild() {

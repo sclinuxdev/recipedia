@@ -371,9 +371,6 @@ pub struct DetailTemplate {
     pub github_url: String,
     pub files: Vec<db::FileLine>,
     pub files_total: usize,
-    /// Actual tools recorded by the representative managed v2 build. Empty
-    /// for v1 and upstream-prebuilt/repackaged packages.
-    pub managed_build_tools: Vec<crate::repo::ManagedBuildTool>,
     /// Representative build ships a universal service definition.
     pub p_daemon: bool,
     pub has_log: bool,
@@ -492,10 +489,6 @@ async fn package_detail(
             .map(|a| (a.clone(), format!("{}?arch={}", base, a)))
             .collect();
         let p_daemon = best_pub.is_some_and(|r| r.is_daemon());
-        let managed_build_tools = best_pub
-            .and_then(|r| r.meta.as_ref())
-            .map(|m| m.managed_build_tools.clone())
-            .unwrap_or_default();
         let tpl = DetailTemplate {
             other_arches,
             state: st,
@@ -504,7 +497,6 @@ async fn package_detail(
             versions: ladder,
             files,
             files_total,
-            managed_build_tools,
             has_log: log.is_some(),
             log_content: log.as_ref().map(|l| l.content.clone()).unwrap_or_default(),
             log_builder: log.as_ref().map(|l| l.builder.clone()).unwrap_or_default(),
