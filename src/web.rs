@@ -115,7 +115,7 @@ impl Nav {
 #[derive(Debug, Clone)]
 pub struct PackageView {
     pub name: String,
-    /// Effective architecture of the recipe (amd64 / aarch64 / any).
+    /// Effective architecture of the recipe (amd64 / aarch64 / riscv64 / armv7 / any).
     pub arch: String,
     /// URL of the recipes tree this row came from.
     pub origin: String,
@@ -585,6 +585,15 @@ fn orphan_row(conn: &Connection, row: &PublishedRow) -> Result<PackageRow> {
             .unwrap_or_default(),
         dependencies: Vec::new(),
         build_dependencies: Vec::new(),
+        check_dependencies: meta
+            .as_ref()
+            .map(|m| {
+                m.check_dependencies
+                    .iter()
+                    .map(|dep| crate::model::parse_dep(dep))
+                    .collect()
+            })
+            .unwrap_or_default(),
         conffiles: meta
             .as_ref()
             .map(|m| m.conffiles.clone())

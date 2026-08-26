@@ -194,7 +194,11 @@ fn parse_recipes_at(git_dir: &Path, path: &Path) -> Result<Vec<RecipeRecord>> {
     Ok(recipes
         .into_iter()
         .map(|r| {
-            let arch = if r.arch.is_empty() { path_arch.clone() } else { canonical_arch(&r.arch).to_string() };
+            let arch = if r.arch.is_empty() {
+                path_arch.clone()
+            } else {
+                canonical_arch(&r.arch).to_string()
+            };
             RecipeRecord {
                 recipe: r,
                 arch,

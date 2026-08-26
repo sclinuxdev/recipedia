@@ -64,6 +64,9 @@ pub struct ManifestMeta {
     pub provides: Vec<String>,
     #[serde(default)]
     pub conffiles: Vec<String>,
+    /// Build-only check dependencies copied from Sage's attestation.
+    #[serde(default)]
+    pub check_dependencies: Vec<String>,
     #[serde(default)]
     pub managed_build_tools: Vec<ManagedBuildTool>,
 }
@@ -181,6 +184,32 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
             })
             .unwrap_or_default()
     };
+    let check_dependencies = if let Some(raw) =
+        pkg.get("attestation_toml").and_then(|value| value.as_str())
+    {
+        let att_doc: toml::Table =
+            toml::from_str(raw).context("attestation_toml is not valid TOML")?;
+        let attestation = att_doc
+            .get("attestation")
+            .and_then(|value| value.as_table());
+        match attestation.and_then(|table| table.get("check_dependencies")) {
+            Some(value) => value
+                .as_array()
+                .context("attestation.check_dependencies must be an array")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .context("attestation.check_dependencies entries must be non-empty strings")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     let managed_build_tools = doc
         .get("managed_build_tools")
         .and_then(|v| v.as_array())
@@ -274,6 +303,7 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
         dependencies: arr("dependencies"),
         provides: arr("provides"),
         conffiles: arr("conffiles"),
+        check_dependencies,
         managed_build_tools,
     };
     if meta.name.is_empty() || meta.version.is_empty() {
@@ -515,6 +545,29 @@ parameters = ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
             parse_manifest("[package]\nname = \"rust-bin\"\nversion = \"1.90\"\nrelease = \"1\"\n")
                 .unwrap();
         assert!(prebuilt.managed_build_tools.is_empty());
+    }
+
+    #[test]
+    fn attestation_check_dependencies_are_preserved_for_orphan_packages() {
+        let meta = parse_manifest(
+            r#"
+schema_version = 2
+[package]
+name = "checked"
+version = "1.0"
+release = "1"
+attestation_toml = """
+schema_version = 2
+[attestation]
+check_dependencies = ["python >= 3.14", "pytest >= 8"]
+"""
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.check_dependencies,
+            vec!["python >= 3.14".to_string(), "pytest >= 8".to_string()]
+        );
     }
 
     #[test]

@@ -47,7 +47,10 @@ same-origin `/repo/...`).
 The canonical tree layout is
 `<category>/<name>/<arch>/<name>-<version>-<release>/recipe.toml`. A sync diffs
 the previous and new commits and reports the architectures touched (`amd64`,
-`aarch64`, `any`) in both the webhook response and sync log.
+`aarch64`, `riscv64`, `armv7`, `any`) in both the webhook response and sync
+log. Recipe-v2 validation mirrors Sage for the executable `check` phase and
+the structured/legacy patch checksum rules; check dependencies remain
+build-only metadata.
 
 ## Deploying (Docker / 1Panel)
 

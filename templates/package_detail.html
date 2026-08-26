@@ -111,6 +111,17 @@
 </table>
 {% endif %}
 
+{% if !pkg.check_dependencies.is_empty() %}
+<h2>Check dependencies</h2>
+<p class="muted">Used only by the Sage build <code>check</code> phase; never installed as a runtime dependency.</p>
+<table>
+  <tr><th>Package</th><th>Constraint</th></tr>
+  {% for d in pkg.check_dependencies %}
+  <tr><td class="mono"><a href="/package/{{ d.name }}">{{ d.name }}</a></td><td class="mono">{{ d.req }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
 {% if !reverse.is_empty() %}
 <h2>Required by</h2>
 <p>{% for r in reverse %}<a class="mono" href="/package/{{ r }}">{{ r }}</a>{{ " " }}{% endfor %}</p>

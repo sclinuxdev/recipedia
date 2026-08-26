@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS packages (
   provides        TEXT NOT NULL,   -- JSON array of strings
   dependencies    TEXT NOT NULL,   -- JSON array of {name, req}
   build_deps      TEXT NOT NULL,   -- JSON array of {name, req}
+  check_deps      TEXT NOT NULL,   -- JSON array of {name, req}
   conffiles       TEXT NOT NULL,   -- JSON array of strings
   source_url      TEXT NOT NULL,
   source_sha256   TEXT NOT NULL,
@@ -104,12 +105,13 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     let has_current_shape: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('packages')
-             WHERE name IN ('arch', 'origin', 'upstream_url', 'upstream_version_regex')",
+             WHERE name IN ('arch', 'origin', 'upstream_url', 'upstream_version_regex',
+                            'build_deps', 'check_deps')",
             [],
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
-        == 4;
+        == 6;
     if !has_current_shape {
         conn.execute("DROP TABLE IF EXISTS packages", [])?;
         conn.execute_batch(SCHEMA)?;
@@ -133,6 +135,7 @@ pub struct PackageRow {
     pub provides: Vec<String>,
     pub dependencies: Vec<Dep>,
     pub build_dependencies: Vec<Dep>,
+    pub check_dependencies: Vec<Dep>,
     pub conffiles: Vec<String>,
     pub source_url: String,
     pub source_sha256: String,
@@ -204,6 +207,7 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
              provides        TEXT NOT NULL,
              dependencies    TEXT NOT NULL,
              build_deps      TEXT NOT NULL,
+             check_deps      TEXT NOT NULL,
              conffiles       TEXT NOT NULL,
              source_url      TEXT NOT NULL,
              source_sha256   TEXT NOT NULL,
@@ -216,9 +220,9 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
     )?;
     let mut stmt = conn.prepare(
         "INSERT INTO packages_new (name, arch, origin, category, version, release, description, license,
-             channel, provides, dependencies, build_deps, conffiles, source_url, source_sha256,
+             channel, provides, dependencies, build_deps, check_deps, conffiles, source_url, source_sha256,
              upstream_url, upstream_version_regex, recipe_path, git_commit, synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
     )?;
     for r in recipes {
         stmt.execute(params![
@@ -234,6 +238,7 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
             serde_json::to_string(&r.recipe.provides)?,
             serde_json::to_string(&r.recipe.dependencies)?,
             serde_json::to_string(&r.recipe.build_dependencies)?,
+            serde_json::to_string(&r.recipe.check_dependencies)?,
             serde_json::to_string(&r.recipe.conffiles)?,
             r.recipe.source_url,
             r.recipe.source_sha256,
@@ -269,7 +274,7 @@ pub struct RecipeRecord {
 
 const PACKAGE_COLS: &str =
     "name, arch, origin, category, version, release, description, license, channel,
-     provides, dependencies, build_deps, conffiles, source_url, source_sha256,
+     provides, dependencies, build_deps, check_deps, conffiles, source_url, source_sha256,
      upstream_url, upstream_version_regex, recipe_path";
 
 fn select_packages(
@@ -817,12 +822,13 @@ fn map_package_row(r: &rusqlite::Row<'_>) -> std::result::Result<PackageRow, rus
         provides: serde_json::from_str(&r.get::<_, String>(9)?).map_err(json_err)?,
         dependencies: serde_json::from_str(&r.get::<_, String>(10)?).map_err(json_err)?,
         build_dependencies: serde_json::from_str(&r.get::<_, String>(11)?).map_err(json_err)?,
-        conffiles: serde_json::from_str(&r.get::<_, String>(12)?).map_err(json_err)?,
-        source_url: r.get(13)?,
-        source_sha256: r.get(14)?,
-        upstream_url: r.get(15)?,
-        upstream_version_regex: r.get(16)?,
-        recipe_path: r.get(17)?,
+        check_dependencies: serde_json::from_str(&r.get::<_, String>(12)?).map_err(json_err)?,
+        conffiles: serde_json::from_str(&r.get::<_, String>(13)?).map_err(json_err)?,
+        source_url: r.get(14)?,
+        source_sha256: r.get(15)?,
+        upstream_url: r.get(16)?,
+        upstream_version_regex: r.get(17)?,
+        recipe_path: r.get(18)?,
     })
 }
 
@@ -858,6 +864,7 @@ mod tests {
                 dependencies: Vec::new(),
                 provides: Vec::new(),
                 conffiles: Vec::new(),
+                check_dependencies: Vec::new(),
                 managed_build_tools: tools,
             }),
         }
@@ -902,7 +909,12 @@ mod tests {
         let recipe = Recipe::from_toml(
             "schema_version = 2\n\
              [package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"1\"\n\
-             [upstream]\nurl = \"https://zlib.net/\"\nversion_regex = 'zlib-(\\d+\\.\\d+\\.\\d+)'\n",
+             arch = \"amd64\"\n\
+             check_dependencies = [\"pkg-config >= 0.29\"]\n\
+             [upstream]\nurl = \"https://zlib.net/\"\nversion_regex = 'zlib-(\\d+\\.\\d+\\.\\d+)'\n\
+             [build]\nsystem = \"script\"\npayload = \"allowlist\"\n\
+             install_files = [\"usr/share/zlib/**\"]\n\
+             [[build.steps]]\nname = \"check\"\nphase = \"check\"\ncommand = \"true\"\n",
         )
         .unwrap();
         rebuild_packages(
@@ -920,5 +932,12 @@ mod tests {
         let row = package_by_name(&conn, "zlib").unwrap().unwrap();
         assert_eq!(row.upstream_url, "https://zlib.net/");
         assert_eq!(row.upstream_version_regex, r"zlib-(\d+\.\d+\.\d+)");
+        assert_eq!(
+            row.check_dependencies,
+            vec![Dep {
+                name: "pkg-config".into(),
+                req: ">= 0.29".into(),
+            }]
+        );
     }
 }
