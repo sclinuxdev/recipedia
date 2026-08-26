@@ -4,6 +4,30 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SysUser {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub description: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub home: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub shell: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub group: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Alternative {
+    pub link: String,
+    pub target: String,
+    pub priority: i64,
+}
+
 /// A parsed recipe. Mirrors sage's extraction semantics: every field may live
 /// at the document root, under `[package]`, or under `[source]` -- the TOML
 /// section-attribution rule means later bare keys land in whichever table was
@@ -33,6 +57,8 @@ pub struct Recipe {
     pub check_dependencies: Vec<Dep>,
     pub provides: Vec<String>,
     pub conffiles: Vec<String>,
+    pub sysusers: Vec<SysUser>,
+    pub alternatives: Vec<Alternative>,
 }
 
 /// Canonical architecture spelling used by recipe paths and published indexes.
@@ -92,6 +118,126 @@ fn valid_sha256(value: &str) -> bool {
 
 fn normalized_sha256(value: &str) -> String {
     value.to_ascii_lowercase()
+}
+
+fn parse_sysusers(doc: &toml::Table) -> Result<Vec<SysUser>> {
+    let Some(value) = doc.get("sysusers") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        anyhow::bail!("sysusers must be an array of tables");
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let entry = item
+            .as_table()
+            .with_context(|| "sysusers entries must be tables")?;
+        for key in entry.keys() {
+            anyhow::ensure!(
+                matches!(
+                    key.as_str(),
+                    "type" | "name" | "id" | "description" | "home" | "shell" | "group"
+                ),
+                "unknown sysusers key '{key}'"
+            );
+        }
+        let kind = table_str(entry, "type")
+            .with_context(|| "sysusers entries require type = user|group")?;
+        let name = table_str(entry, "name")
+            .with_context(|| "sysusers entries require a name")?;
+        anyhow::ensure!(
+            matches!(kind.as_str(), "user" | "group"),
+            "sysusers type must be user or group"
+        );
+        anyhow::ensure!(
+            !name.is_empty() && !name.contains('/') && name != "." && name != "..",
+            "sysusers entries require a simple non-empty name"
+        );
+        anyhow::ensure!(seen.insert(name.clone()), "duplicate sysusers name '{name}'");
+        let id = entry
+            .get("id")
+            .map(|value| {
+                value
+                    .as_integer()
+                    .with_context(|| "sysusers id must be an integer")
+            })
+            .transpose()?;
+        if let Some(id) = id {
+            anyhow::ensure!(
+                id > 0 && id <= 0x7FFF_FFFF,
+                "sysusers id must be a positive system uid/gid"
+            );
+        }
+        out.push(SysUser {
+            kind,
+            name,
+            id,
+            description: table_str(entry, "description").unwrap_or_default(),
+            home: table_str(entry, "home").unwrap_or_default(),
+            shell: table_str(entry, "shell").unwrap_or_default(),
+            group: table_str(entry, "group").unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_alternatives(doc: &toml::Table) -> Result<Vec<Alternative>> {
+    let Some(value) = doc.get("alternatives") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        anyhow::bail!("alternatives must be an array of tables");
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let entry = item
+            .as_table()
+            .with_context(|| "alternatives entries must be tables")?;
+        for key in entry.keys() {
+            anyhow::ensure!(
+                matches!(key.as_str(), "link" | "target" | "priority"),
+                "unknown alternatives key '{key}'"
+            );
+        }
+        let link = table_str(entry, "link")
+            .with_context(|| "alternatives entries require a link path")?;
+        let target = table_str(entry, "target")
+            .with_context(|| "alternatives entries require a target")?;
+        anyhow::ensure!(
+            !link.is_empty() && !link.starts_with('/') && !link.contains(".."),
+            "alternatives require a relative link path"
+        );
+        anyhow::ensure!(
+            seen.insert(link.clone()),
+            "duplicate alternative link '{link}'"
+        );
+        anyhow::ensure!(
+            !target.is_empty() && !target.starts_with('/'),
+            "alternatives require a relative target"
+        );
+        let priority = entry
+            .get("priority")
+            .map(|value| {
+                let priority = value
+                    .as_integer()
+                    .with_context(|| "alternatives priority must be an integer")?;
+                anyhow::ensure!(
+                    (0..=1000).contains(&priority),
+                    "alternatives priority must be between 0 and 1000"
+                );
+                Ok(priority)
+            })
+            .transpose()?
+            .unwrap_or(50);
+        out.push(Alternative {
+            link,
+            target,
+            priority,
+        });
+    }
+    Ok(out)
 }
 
 fn basename(value: &str) -> bool {
@@ -171,7 +317,7 @@ fn validate_v2(doc: &toml::Table) -> Result<()> {
     anyhow::ensure!(
         matches!(
             system,
-            "autotools" | "cmake" | "meson" | "xmake" | "cargo" | "make" | "script"
+            "autotools" | "cmake" | "meson" | "xmake" | "cargo" | "go" | "make" | "script"
         ),
         "unsupported v2 build.system '{system}'"
     );
@@ -179,6 +325,84 @@ fn validate_v2(doc: &toml::Table) -> Result<()> {
         matches!(payload, "all" | "allowlist" | "outputs"),
         "unsupported v2 build.payload '{payload}'"
     );
+    if let Some(value) = build.get("tools") {
+        anyhow::ensure!(
+            value.as_bool().is_some(),
+            "build.tools must be boolean"
+        );
+        if value.as_bool() == Some(true) {
+            anyhow::ensure!(
+                system == "script",
+                "build.tools=true is valid only for script recipes"
+            );
+        }
+    }
+    if let Some(value) = build.get("network") {
+        anyhow::ensure!(
+            value.as_bool().is_some(),
+            "build.network must be boolean"
+        );
+    }
+    if let Some(value) = build.get("flag_policy") {
+        let policy = value
+            .as_table()
+            .with_context(|| "build.flag_policy must be a table")?;
+        for key in policy.keys() {
+            anyhow::ensure!(
+                matches!(key.as_str(), "lto" | "march" | "as-needed"),
+                "unknown build.flag_policy key '{key}'"
+            );
+            let flag = policy[key]
+                .as_bool()
+                .with_context(|| format!("build.flag_policy.{key} must be boolean"))?;
+            anyhow::ensure!(
+                !flag,
+                "build.flag_policy.{key}=true is the default; flag_policy declares downgrades only"
+            );
+        }
+    }
+    if let Some(value) = build.get("content") {
+        let content = value
+            .as_table()
+            .with_context(|| "build.content must be a table")?;
+        for key in content.keys() {
+            anyhow::ensure!(
+                matches!(key.as_str(), "strip" | "man_compress" | "shebangs" | "locales"),
+                "unknown build.content key '{key}'"
+            );
+        }
+        if let Some(strip) = content.get("strip") {
+            anyhow::ensure!(
+                strip.as_str().is_some_and(|v| matches!(v, "none" | "unneeded" | "debug")),
+                "build.content.strip must be none, unneeded, or debug"
+            );
+        }
+        if let Some(compress) = content.get("man_compress") {
+            anyhow::ensure!(
+                compress
+                    .as_str()
+                    .is_some_and(|v| matches!(v, "none" | "gzip")),
+                "build.content.man_compress must be none or gzip"
+            );
+        }
+        if let Some(shebangs) = content.get("shebangs") {
+            anyhow::ensure!(
+                shebangs.as_str() == Some("absolute"),
+                "build.content.shebangs must be \"absolute\""
+            );
+        }
+        if let Some(locales) = content.get("locales") {
+            let Some(items) = locales.as_array() else {
+                anyhow::bail!("build.content.locales must be an array of strings");
+            };
+            anyhow::ensure!(
+                items.iter().all(|item| {
+                    item.as_str().is_some_and(|v| !v.is_empty() && !v.contains('/'))
+                }),
+                "build.content.locales must be plain locale names"
+            );
+        }
+    }
 
     let mut has_check_phase = false;
     if let Some(value) = build.get("steps") {
@@ -471,7 +695,7 @@ impl Recipe {
             .and_then(|b| b.get("toolchain"))
             .and_then(|v| v.as_table())
         {
-            for kind in ["compiler", "linker", "rust"] {
+            for kind in ["compiler", "linker", "rust", "go"] {
                 let Some(tool) = toolchain.get(kind).and_then(|v| v.as_table()) else {
                     continue;
                 };
@@ -484,7 +708,8 @@ impl Recipe {
                 let supported = match kind {
                     "compiler" => matches!(family.as_str(), "clang" | "gcc"),
                     "linker" => matches!(family.as_str(), "lld" | "mold" | "ld"),
-                    _ => family == "rustc",
+                    "rust" => family == "rustc",
+                    _ => family == "go",
                 };
                 anyhow::ensure!(
                     supported,
@@ -498,6 +723,16 @@ impl Recipe {
                     anyhow::ensure!(
                         system.as_deref() == Some("cargo"),
                         "build.toolchain.rust is valid only for Cargo recipes"
+                    );
+                }
+                if kind == "go" {
+                    let system = doc
+                        .get("build")
+                        .and_then(|v| v.as_table())
+                        .and_then(|b| table_str(b, "system"));
+                    anyhow::ensure!(
+                        system.as_deref() == Some("go"),
+                        "build.toolchain.go is valid only for Go recipes"
                     );
                 }
                 if !build_dependencies
@@ -545,6 +780,8 @@ impl Recipe {
             check_dependencies: check_dependencies.iter().map(|s| parse_dep(s)).collect(),
             provides,
             conffiles,
+            sysusers: parse_sysusers(&doc)?,
+            alternatives: parse_alternatives(&doc)?,
         })
     }
     pub fn from_toml_all(text: &str) -> Result<Vec<Self>> {
@@ -626,6 +863,8 @@ impl Recipe {
                 check_dependencies: primary.check_dependencies.clone(),
                 provides: out_provides,
                 conffiles: out_conffiles,
+                sysusers: primary.sysusers.clone(),
+                alternatives: primary.alternatives.clone(),
             };
 
             if out_name == primary.name {

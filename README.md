@@ -59,9 +59,9 @@ matching x86_64 glibc binaries from GitHub Releases instead of compiling on
 the server. Build it only after that release exists:
 
 ```sh
-docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.5 \
-  -t recipedia:0.1.5 -t recipedia:latest \
-  https://github.com/sclinuxdev/recipedia.git#v0.1.5
+docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.6 \
+  -t recipedia:0.1.6 -t recipedia:latest \
+  https://github.com/sclinuxdev/recipedia.git#v0.1.6
 install -d -m 0750 /srv/recipedia
 RECIPEEDIA_DATA_DIR=/srv/recipedia docker compose up -d --force-recreate
 docker exec recipedia recipedia-server token <label>
@@ -77,7 +77,7 @@ the split domains shown in `compose.yaml`, proxy the repository domain to
 webhook payload URL as `https://<frontend>/api/webhook/github`, content type
 `application/json`, and use the same secret as `RECIPEEDIA_WEBHOOK_SECRET`.
 
-To upgrade, replace `0.1.5` with the new release in the build command, retag
+To upgrade, replace `0.1.6` with the new release in the build command, retag
 `recipedia:latest`, and run `docker compose up -d --force-recreate` again. The
 mounted data directory is reused and the disposable recipe cache is rebuilt
 from the canonical git source.
