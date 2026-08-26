@@ -4,3 +4,6 @@
 *.sqlite-wal
 target/
 .build-home/
+dist*/
+/dist*
+dist/

@@ -115,35 +115,37 @@ pub fn collect_recipes(git_dir: &Path, origin_url: &str) -> Result<Vec<RecipeRec
                 }
                 stack.push(path);
             } else if path.file_name().is_some_and(|n| n == "recipe.toml") {
-                let mut record = parse_recipe_at(git_dir, &path)?;
-                record.origin = origin_url.to_string();
-                let key = (
-                    record.recipe.name.clone(),
-                    record.arch.clone(),
-                    record.recipe.version.clone(),
-                    record.recipe.release.clone(),
-                );
-                if let Some(dup) = out.get(&key) {
-                    bail!(
-                        "duplicate package '{}-{}-{}-{}' at {}/{} and {}/{}",
-                        record.recipe.name,
-                        record.arch,
-                        record.recipe.version,
-                        record.recipe.release,
-                        dup.origin,
-                        dup.recipe_path,
-                        origin_url,
-                        record.recipe_path
+                let records = parse_recipes_at(git_dir, &path)?;
+                for mut record in records {
+                    record.origin = origin_url.to_string();
+                    let key = (
+                        record.recipe.name.clone(),
+                        record.arch.clone(),
+                        record.recipe.version.clone(),
+                        record.recipe.release.clone(),
                     );
+                    if let Some(dup) = out.get(&key) {
+                        bail!(
+                            "duplicate package '{}-{}-{}-{}' at {}/{} and {}/{}",
+                            record.recipe.name,
+                            record.arch,
+                            record.recipe.version,
+                            record.recipe.release,
+                            dup.origin,
+                            dup.recipe_path,
+                            origin_url,
+                            record.recipe_path
+                        );
+                    }
+                    out.insert(key, record);
                 }
-                out.insert(key, record);
             }
         }
     }
     Ok(out.into_values().collect())
 }
 
-fn parse_recipe_at(git_dir: &Path, path: &Path) -> Result<RecipeRecord> {
+fn parse_recipes_at(git_dir: &Path, path: &Path) -> Result<Vec<RecipeRecord>> {
     let rel = path
         .strip_prefix(git_dir)
         .context("recipe outside mirror")?
@@ -164,40 +166,46 @@ fn parse_recipe_at(git_dir: &Path, path: &Path) -> Result<RecipeRecord> {
         other => bail!("unexpected recipe layout: {}", other.join("/")),
     };
     let text = std::fs::read_to_string(path)?;
-    let recipe = Recipe::from_toml(&text).with_context(|| format!("parsing {rel}"))?;
-    if recipe.name != path_name {
+    let recipes = Recipe::from_toml_all(&text).with_context(|| format!("parsing {rel}"))?;
+    let primary = recipes.first().context("recipe produced no outputs")?;
+    if primary.name != path_name {
         bail!(
             "recipe name '{}' does not match path package '{}' at {rel}",
-            recipe.name,
+            primary.name,
             path_name
         );
     }
-    if recipe.arch.is_empty() {
+    if primary.arch.is_empty() {
         bail!("recipe must declare arch matching its single-tree path at {rel}");
     }
-    if canonical_arch(&recipe.arch) != path_arch {
+    if canonical_arch(&primary.arch) != path_arch {
         bail!(
             "recipe arch '{}' does not match path arch '{}' at {rel}",
-            recipe.arch,
+            primary.arch,
             path_arch
         );
     }
-    let expected_identity = format!("{}-{}-{}", recipe.name, recipe.version, recipe.release);
+    let expected_identity = format!("{}-{}-{}", primary.name, primary.version, primary.release);
     if identity != expected_identity {
         bail!(
             "recipe identity '{expected_identity}' does not match directory '{identity}' at {rel}"
         );
     }
-    Ok(RecipeRecord {
-        recipe,
-        arch: path_arch,
-        origin: String::new(),
-        category,
-        recipe_path,
-        git_commit: String::new(),
-    })
+    Ok(recipes
+        .into_iter()
+        .map(|r| {
+            let arch = if r.arch.is_empty() { path_arch.clone() } else { canonical_arch(&r.arch).to_string() };
+            RecipeRecord {
+                recipe: r,
+                arch,
+                origin: String::new(),
+                category: category.clone(),
+                recipe_path: recipe_path.clone(),
+                git_commit: String::new(),
+            }
+        })
+        .collect())
 }
-
 fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new(prog)
         .args(args)

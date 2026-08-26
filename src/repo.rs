@@ -130,14 +130,23 @@ pub fn read_file_list(archive: &Path) -> Result<Vec<db::FileLine>> {
                 .filter(|l| !l.starts_with('#'))
                 .filter_map(|l| {
                     let cols: Vec<&str> = l.split('\t').collect();
-                    if cols.len() < 5 {
-                        return None;
+                    if cols.len() >= 9 {
+                        // Modern Sage 9-column v2 format: type\tmode\tuid\tgid\tcaps\tsize\tsha256\tpath\ttarget
+                        Some(db::FileLine {
+                            kind: cols[0].to_string(),
+                            size: cols[5].parse().unwrap_or(0),
+                            path: cols[7].to_string(),
+                        })
+                    } else if cols.len() >= 5 {
+                        // Legacy 6-column format: type\tmode\tsize\tsha256\tpath[\ttarget]
+                        Some(db::FileLine {
+                            kind: cols[0].to_string(),
+                            size: cols[2].parse().unwrap_or(0),
+                            path: cols[4].to_string(),
+                        })
+                    } else {
+                        None
                     }
-                    Some(db::FileLine {
-                        kind: cols[0].to_string(),
-                        size: cols[2].parse().unwrap_or(0),
-                        path: cols[4].to_string(),
-                    })
                 })
                 .collect());
         }
@@ -506,5 +515,46 @@ parameters = ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
             parse_manifest("[package]\nname = \"rust-bin\"\nversion = \"1.90\"\nrelease = \"1\"\n")
                 .unwrap();
         assert!(prebuilt.managed_build_tools.is_empty());
+    }
+
+    #[test]
+    fn files_idx_supports_both_6_and_9_columns() {
+        let parse_lines = |text: &str| -> Vec<crate::db::FileLine> {
+            text.lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| {
+                    let cols: Vec<&str> = l.split('\t').collect();
+                    if cols.len() >= 9 {
+                        Some(crate::db::FileLine {
+                            kind: cols[0].to_string(),
+                            size: cols[5].parse().unwrap_or(0),
+                            path: cols[7].to_string(),
+                        })
+                    } else if cols.len() >= 5 {
+                        Some(crate::db::FileLine {
+                            kind: cols[0].to_string(),
+                            size: cols[2].parse().unwrap_or(0),
+                            path: cols[4].to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let six_col = "f\t755\t1234\tdeadbeef\tusr/bin/tool\t-\n";
+        let res6 = parse_lines(six_col);
+        assert_eq!(res6.len(), 1);
+        assert_eq!(res6[0].kind, "f");
+        assert_eq!(res6[0].size, 1234);
+        assert_eq!(res6[0].path, "usr/bin/tool");
+
+        let nine_col = "f\t755\t0\t0\tcap_net_admin=+ep\t5678\tfeedbeef\tusr/bin/admin\t-\n";
+        let res9 = parse_lines(nine_col);
+        assert_eq!(res9.len(), 1);
+        assert_eq!(res9[0].kind, "f");
+        assert_eq!(res9[0].size, 5678);
+        assert_eq!(res9[0].path, "usr/bin/admin");
     }
 }

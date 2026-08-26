@@ -221,6 +221,86 @@ impl Recipe {
             conffiles,
         })
     }
+    pub fn from_toml_all(text: &str) -> Result<Vec<Self>> {
+        let primary = Self::from_toml(text)?;
+        let doc: toml::Table = toml::from_str(text).context("recipe.toml is not valid TOML")?;
+        let outputs = doc
+            .get("build")
+            .and_then(|v| v.as_table())
+            .and_then(|b| b.get("outputs"))
+            .and_then(|v| v.as_array());
+
+        let Some(outputs) = outputs else {
+            return Ok(vec![primary]);
+        };
+
+        if outputs.is_empty() {
+            return Ok(vec![primary]);
+        }
+
+        let mut result = Vec::new();
+        let mut primary_updated = false;
+
+        for item in outputs {
+            let Some(out_table) = item.as_table() else { continue; };
+            let out_name = table_str(out_table, "name");
+            let Some(out_name) = out_name else { continue; };
+
+            let out_ver = table_str(out_table, "version").unwrap_or_else(|| primary.version.clone());
+            let out_rel = table_str(out_table, "release").unwrap_or_else(|| primary.release.clone());
+            let out_desc = table_str(out_table, "description").unwrap_or_else(|| primary.description.clone());
+            let out_lic = table_str(out_table, "license").unwrap_or_else(|| primary.license.clone());
+            let out_channel = table_str(out_table, "channel").unwrap_or_else(|| primary.channel.clone());
+            let out_arch = table_str(out_table, "arch")
+                .map(|a| canonical_arch(&a).to_string())
+                .unwrap_or_else(|| primary.arch.clone());
+
+            let out_deps = if out_table.contains_key("dependencies") {
+                table_strings(out_table, "dependencies").iter().map(|s| parse_dep(s)).collect()
+            } else {
+                Vec::new()
+            };
+            let out_provides = if out_table.contains_key("provides") {
+                table_strings(out_table, "provides")
+            } else {
+                Vec::new()
+            };
+            let out_conffiles = if out_table.contains_key("conffiles") {
+                table_strings(out_table, "conffiles")
+            } else {
+                Vec::new()
+            };
+
+            let r = Recipe {
+                name: out_name.clone(),
+                version: out_ver,
+                release: out_rel,
+                description: out_desc,
+                license: out_lic,
+                channel: out_channel,
+                arch: out_arch,
+                source_url: primary.source_url.clone(),
+                source_sha256: primary.source_sha256.clone(),
+                upstream_url: primary.upstream_url.clone(),
+                upstream_version_regex: primary.upstream_version_regex.clone(),
+                dependencies: out_deps,
+                build_dependencies: primary.build_dependencies.clone(),
+                provides: out_provides,
+                conffiles: out_conffiles,
+            };
+
+            if out_name == primary.name {
+                primary_updated = true;
+            }
+            result.push(r);
+        }
+
+        if !primary_updated {
+            result.insert(0, primary);
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +412,49 @@ mod tests {
         .unwrap();
         assert_eq!(compatible.upstream_url, "https://zlib.net/");
         assert_eq!(compatible.upstream_version_regex, r"v(\d+)");
+    }
+
+    #[test]
+    fn multi_output_recipe_yields_all_subpackages() {
+        let text = r#"
+schema_version = 2
+[package]
+name = "zlib"
+version = "1.3.2"
+release = "1"
+description = "zlib runtime"
+license = "Zlib"
+channel = "system"
+arch = "amd64"
+
+[source]
+url = "https://zlib.net/zlib-1.3.2.tar.gz"
+sha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+
+[build]
+system = "autotools"
+payload = "outputs"
+
+[[build.outputs]]
+name = "zlib"
+description = "zlib runtime"
+license = "Zlib"
+provides = ["zlib", "so:libz.so.1"]
+
+[[build.outputs]]
+name = "zlib-dev"
+description = "zlib development headers"
+license = "Zlib"
+dependencies = ["zlib >= 1.3.2"]
+provides = ["zlib-dev"]
+"#;
+        let all = Recipe::from_toml_all(text).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "zlib");
+        assert_eq!(all[0].provides, vec!["zlib", "so:libz.so.1"]);
+        assert_eq!(all[1].name, "zlib-dev");
+        assert_eq!(all[1].dependencies.len(), 1);
+        assert_eq!(all[1].dependencies[0].name, "zlib");
+        assert_eq!(all[1].dependencies[0].req, ">= 1.3.2");
     }
 }
