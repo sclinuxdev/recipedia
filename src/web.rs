@@ -133,27 +133,40 @@ pub struct PackageView {
 impl PackageView {
     /// Renderable build time for list pages (empty when nothing published).
     pub fn published_time(&self) -> String {
-        if self.built_at > 0 { db::time_hm_pub(self.built_at) } else { String::new() }
+        if self.built_at > 0 {
+            db::time_hm_pub(self.built_at)
+        } else {
+            String::new()
+        }
     }
     /// Same instant as UTC ISO-8601 for `<time datetime>` (client-side
     /// timezone conversion); empty when nothing published.
     pub fn published_iso(&self) -> String {
-        if self.built_at > 0 { db::time_utc(self.built_at) } else { String::new() }
+        if self.built_at > 0 {
+            db::time_utc(self.built_at)
+        } else {
+            String::new()
+        }
     }
     /// True when the repository carries a different version than the recipe.
     pub fn repo_differs(&self) -> bool {
-        !self.repo_version.is_empty() && self.repo_version != format!("{}-{}", self.version, self.release)
+        !self.repo_version.is_empty()
+            && self.repo_version != format!("{}-{}", self.version, self.release)
     }
 }
 
-fn package_views(conn: &Connection, filter: impl Fn(&PackageRow) -> bool) -> Result<Vec<PackageView>> {
+fn package_views(
+    conn: &Connection,
+    filter: impl Fn(&PackageRow) -> bool,
+) -> Result<Vec<PackageView>> {
     let published = published_by_name(conn)?;
     let rows = db::latest_packages(conn)?;
     Ok(rows
         .iter()
         .filter(|r| filter(r))
         .map(|r| {
-            let published = pick_published(published.get(&r.name).map(Vec::as_slice), &r.arch, None);
+            let published =
+                pick_published(published.get(&r.name).map(Vec::as_slice), &r.arch, None);
             PackageView {
                 name: r.name.clone(),
                 arch: r.arch.clone(),
@@ -202,8 +215,10 @@ fn pick_published<'a>(
     want_same_version: Option<&str>,
 ) -> Option<&'a PublishedRow> {
     let rows = rows?;
-    let mut compatible: Vec<&PublishedRow> =
-        rows.iter().filter(|p| arch_match(recipe_arch, &p.arch)).collect();
+    let mut compatible: Vec<&PublishedRow> = rows
+        .iter()
+        .filter(|p| arch_match(recipe_arch, &p.arch))
+        .collect();
     if compatible.is_empty() {
         return None;
     }
@@ -356,6 +371,9 @@ pub struct DetailTemplate {
     pub github_url: String,
     pub files: Vec<db::FileLine>,
     pub files_total: usize,
+    /// Actual tools recorded by the representative managed v2 build. Empty
+    /// for v1 and upstream-prebuilt/repackaged packages.
+    pub managed_build_tools: Vec<crate::repo::ManagedBuildTool>,
     /// Representative build ships a universal service definition.
     pub p_daemon: bool,
     pub has_log: bool,
@@ -385,7 +403,11 @@ async fn package_detail(
             .filter(|a| arches.contains(a))
             .or_else(|| arches.first().cloned());
         let versions: Vec<PackageRow> = match &selected_arch {
-            Some(arch) => all_versions.iter().filter(|v| &v.arch == arch).cloned().collect(),
+            Some(arch) => all_versions
+                .iter()
+                .filter(|v| &v.arch == arch)
+                .cloned()
+                .collect(),
             None => all_versions,
         };
         let published_all = db::published_for_name(conn, &name)?;
@@ -407,7 +429,12 @@ async fn package_detail(
                 // `cc`, ...): list the providers instead of dead-ending.
                 let provider_names = db::providers(conn, &name)?;
                 if !provider_names.is_empty() {
-                    return render_virtual(conn, &name, &provider_names, Nav::from_config(&state.config));
+                    return render_virtual(
+                        conn,
+                        &name,
+                        &provider_names,
+                        Nav::from_config(&state.config),
+                    );
                 }
                 // Published but recipeless (recipe removed / pre-tree build):
                 // describe it from its own manifest meta.
@@ -446,11 +473,15 @@ async fn package_detail(
             Some(row) => {
                 let all = db::file_list(conn, &row.filename)?;
                 let total = all.len();
-                (all.into_iter().take(DETAIL_FILES_SHOWN).collect(), total, db::log_get(conn, &row.filename)?)
+                (
+                    all.into_iter().take(DETAIL_FILES_SHOWN).collect(),
+                    total,
+                    db::log_get(conn, &row.filename)?,
+                )
             }
             None => (Vec::new(), 0, None),
         };
-        let recipe_toml = std::fs::read_to_string(state.config.git_dir(&pkg.arch).join(&pkg.recipe_path))
+        let recipe_toml = std::fs::read_to_string(state.config.git_dir().join(&pkg.recipe_path))
             .unwrap_or_else(|_| "<recipe not on disk>".to_string());
         let github_url = github_blob_url(&pkg.origin, &pkg.recipe_path);
         let reverse = db::reverse_deps(conn, &name)?;
@@ -461,6 +492,10 @@ async fn package_detail(
             .map(|a| (a.clone(), format!("{}?arch={}", base, a)))
             .collect();
         let p_daemon = best_pub.is_some_and(|r| r.is_daemon());
+        let managed_build_tools = best_pub
+            .and_then(|r| r.meta.as_ref())
+            .map(|m| m.managed_build_tools.clone())
+            .unwrap_or_default();
         let tpl = DetailTemplate {
             other_arches,
             state: st,
@@ -469,6 +504,7 @@ async fn package_detail(
             versions: ladder,
             files,
             files_total,
+            managed_build_tools,
             has_log: log.is_some(),
             log_content: log.as_ref().map(|l| l.content.clone()).unwrap_or_default(),
             log_builder: log.as_ref().map(|l| l.builder.clone()).unwrap_or_default(),
@@ -517,7 +553,15 @@ fn render_virtual(
             repo_version: v.repo_version,
         })
         .collect();
-    Ok(Html(VirtualTemplate { name: name.to_string(), providers, nav }.render()?).into_response())
+    Ok(Html(
+        VirtualTemplate {
+            name: name.to_string(),
+            providers,
+            nav,
+        }
+        .render()?,
+    )
+    .into_response())
 }
 
 /// A pseudo-recipe row for a package that exists only in the repository:
@@ -529,17 +573,34 @@ fn orphan_row(conn: &Connection, row: &PublishedRow) -> Result<PackageRow> {
         arch: crate::model::canonical_arch(&row.arch).to_string(),
         origin: String::new(),
         category: "orphan".into(),
-        version: meta.as_ref().map(|m| m.version.clone()).unwrap_or_else(|| row.version.clone()),
-        release: meta.as_ref().map(|m| m.release.clone()).unwrap_or_else(|| row.release.clone()),
-        description: meta.as_ref().map(|m| m.description.clone()).unwrap_or_default(),
+        version: meta
+            .as_ref()
+            .map(|m| m.version.clone())
+            .unwrap_or_else(|| row.version.clone()),
+        release: meta
+            .as_ref()
+            .map(|m| m.release.clone())
+            .unwrap_or_else(|| row.release.clone()),
+        description: meta
+            .as_ref()
+            .map(|m| m.description.clone())
+            .unwrap_or_default(),
         license: meta.as_ref().map(|m| m.license.clone()).unwrap_or_default(),
         channel: meta.as_ref().map(|m| m.channel.clone()).unwrap_or_default(),
-        provides: meta.as_ref().map(|m| m.provides.clone()).unwrap_or_default(),
+        provides: meta
+            .as_ref()
+            .map(|m| m.provides.clone())
+            .unwrap_or_default(),
         dependencies: Vec::new(),
         build_dependencies: Vec::new(),
-        conffiles: meta.as_ref().map(|m| m.conffiles.clone()).unwrap_or_default(),
+        conffiles: meta
+            .as_ref()
+            .map(|m| m.conffiles.clone())
+            .unwrap_or_default(),
         source_url: String::new(),
         source_sha256: String::new(),
+        upstream_url: String::new(),
+        upstream_version_regex: String::new(),
         recipe_path: String::new(),
     })
 }
@@ -602,36 +663,56 @@ async fn status_page(
             .collect();
         arches.sort();
         arches.dedup();
-        let views = package_views(conn, |r| {
-            arch_filter.is_empty() || r.arch == arch_filter
-        })?;
-        let mut missing: Vec<_> = views.iter().filter(|v| v.state == BuildState::Missing).cloned().collect();
-        let mut outdated: Vec<_> = views.iter().filter(|v| v.state == BuildState::Outdated).cloned().collect();
-        let ahead: Vec<_> = views.iter().filter(|v| v.state == BuildState::Ahead).cloned().collect();
-        let built = views.iter().filter(|v| v.state == BuildState::Built).count();
+        let views = package_views(conn, |r| arch_filter.is_empty() || r.arch == arch_filter)?;
+        let mut missing: Vec<_> = views
+            .iter()
+            .filter(|v| v.state == BuildState::Missing)
+            .cloned()
+            .collect();
+        let mut outdated: Vec<_> = views
+            .iter()
+            .filter(|v| v.state == BuildState::Outdated)
+            .cloned()
+            .collect();
+        let ahead: Vec<_> = views
+            .iter()
+            .filter(|v| v.state == BuildState::Ahead)
+            .cloned()
+            .collect();
+        let built = views
+            .iter()
+            .filter(|v| v.state == BuildState::Built)
+            .count();
         missing.sort_by(|a, b| a.name.cmp(&b.name));
         outdated.sort_by(|a, b| a.name.cmp(&b.name));
-        let tpl = StatusTemplate { missing, outdated, ahead, built, arch: arch_filter, arches, nav: Nav::from_config(&state.config) };
+        let tpl = StatusTemplate {
+            missing,
+            outdated,
+            ahead,
+            built,
+            arch: arch_filter,
+            arches,
+            nav: Nav::from_config(&state.config),
+        };
         Ok(Html(tpl.render()?).into_response())
     })
 }
 
-/// One aggregated recipes tree as the About page presents it.
+/// The canonical recipes tree as the About page presents it.
 #[derive(Serialize)]
 pub struct SourceInfo {
-    pub arch: String,
     pub url: String,
     /// HEAD at the last sync, short form; empty before the first sync.
     pub commit: String,
 }
 
-/// `/about` — what this site is, which trees it aggregates, and exactly
+/// `/about` — the site's single recipe source and serving build.
 /// which build of recipedia is serving it.
 #[derive(Template)]
 #[template(path = "about.html")]
 pub struct AboutTemplate {
     pub version: String,
-    pub sources: Vec<SourceInfo>,
+    pub source: SourceInfo,
     pub recipe_count: i64,
     pub published_count: i64,
     pub last_sync: Option<SyncEntry>,
@@ -640,22 +721,17 @@ pub struct AboutTemplate {
 
 async fn about_page(State(state): State<SharedState>) -> Response {
     with_conn(&state, |conn| {
-        let sources = state
-            .config
-            .git_sources
-            .iter()
-            .map(|s| {
-                let commit = db::meta_get(conn, &format!("last_commit:{}", s.arch))
-                    .ok()
-                    .flatten()
-                    .map(|full| full[..12.min(full.len())].to_string())
-                    .unwrap_or_default();
-                SourceInfo { arch: s.arch.clone(), url: s.url.clone(), commit }
-            })
-            .collect();
+        let commit = db::meta_get(conn, "last_commit")
+            .ok()
+            .flatten()
+            .map(|full| full[..12.min(full.len())].to_string())
+            .unwrap_or_default();
         let tpl = AboutTemplate {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            sources,
+            source: SourceInfo {
+                url: state.config.git_url.clone(),
+                commit,
+            },
             recipe_count: db::categories(conn)?.iter().map(|c| c.count).sum(),
             published_count: db::published_all(conn)?.len() as i64,
             last_sync: db::recent_syncs(conn, 1)?.into_iter().next(),
@@ -672,7 +748,9 @@ pub struct UploadTemplate {
 }
 
 async fn upload_page(State(state): State<SharedState>) -> Response {
-    let tpl = UploadTemplate { nav: Nav::from_config(&state.config) };
+    let tpl = UploadTemplate {
+        nav: Nav::from_config(&state.config),
+    };
     Html(tpl.render().expect("static template")).into_response()
 }
 
@@ -688,12 +766,22 @@ fn authorize(state: &SharedState, headers: &HeaderMap) -> Result<String, Box<Res
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
     let Some(token) = presented else {
-        return Err(Box::new((StatusCode::UNAUTHORIZED, "missing bearer token").into_response()));
+        return Err(Box::new(
+            (StatusCode::UNAUTHORIZED, "missing bearer token").into_response(),
+        ));
     };
     match db::token_label(&state.db.lock().expect("db mutex poisoned"), token) {
         Ok(Some(label)) => Ok(label),
-        Ok(None) => Err(Box::new((StatusCode::UNAUTHORIZED, "invalid token").into_response())),
-        Err(e) => Err(Box::new((StatusCode::INTERNAL_SERVER_ERROR, format!("token check failed: {e:#}")).into_response())),
+        Ok(None) => Err(Box::new(
+            (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        )),
+        Err(e) => Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("token check failed: {e:#}"),
+            )
+                .into_response(),
+        )),
     }
 }
 
@@ -716,14 +804,18 @@ async fn publish(
         .map(str::to_owned);
 
     std::fs::create_dir_all(&state.config.repo_dir).ok();
-    let tmp_path = state
-        .config
-        .repo_dir
-        .join(format!(".incoming-{}-{}", std::process::id(), filename));
+    let tmp_path =
+        state
+            .config
+            .repo_dir
+            .join(format!(".incoming-{}-{}", std::process::id(), filename));
     let mut file = match tokio::fs::File::create(&tmp_path).await {
         Ok(f) => f,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot stage upload: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot stage upload: {e}"),
+            )
                 .into_response()
         }
     };
@@ -761,16 +853,32 @@ async fn publish(
     let staged = tmp_path.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().expect("publish worker: db mutex poisoned");
-        repo::ingest(&conn, &config, &staged, &ingest_name, &sha256, declared.as_deref(), &builder)
+        repo::ingest(
+            &conn,
+            &config,
+            &staged,
+            &ingest_name,
+            &sha256,
+            declared.as_deref(),
+            &builder,
+        )
     })
     .await;
     match result {
         Ok(Ok(receipt)) => json_response(&receipt),
         Ok(Err(e)) => {
             tokio::fs::remove_file(&tmp_path).await.ok();
-            (StatusCode::UNPROCESSABLE_ENTITY, format!("publish rejected: {e:#}")).into_response()
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("publish rejected: {e:#}"),
+            )
+                .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("publish task panicked: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("publish task panicked: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -794,13 +902,28 @@ async fn unpublish_file(
     };
     match exists {
         Ok(Some(_)) => {}
-        Ok(None) => return (StatusCode::NOT_FOUND, format!("{filename} is not published")).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {e:#}")).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("{filename} is not published"),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("database error: {e:#}"),
+            )
+                .into_response()
+        }
     }
     let config = state.config.clone();
     let target = filename.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().expect("unpublish worker: db mutex poisoned");
+        let conn = state
+            .db
+            .lock()
+            .expect("unpublish worker: db mutex poisoned");
         repo::unpublish(&conn, &config, &target)
     })
     .await;
@@ -811,7 +934,11 @@ async fn unpublish_file(
             format!("unpublish failed: {e:#}"),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task panicked: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task panicked: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -835,14 +962,18 @@ async fn upload_log(
     }
     let content = match std::str::from_utf8(&body) {
         Ok(text) => text,
-        Err(_) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "log must be UTF-8 text").into_response(),
+        Err(_) => {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "log must be UTF-8 text").into_response()
+        }
     };
     let target = filename.clone();
     let result: Result<usize> = (|| {
         let conn = state.db.lock().expect("db mutex poisoned");
         // Only logs for things actually published: no orphans, no squatting.
         match db::published_sha256(&conn, &target)? {
-            Some(_) => db::log_upsert(&conn, &target, content.trim_end(), &builder).map(|_| body.len()),
+            Some(_) => {
+                db::log_upsert(&conn, &target, content.trim_end(), &builder).map(|_| body.len())
+            }
             None => anyhow::bail!("{target} is not published"),
         }
     })();
@@ -855,7 +986,6 @@ async fn upload_log(
             .into_response(),
     }
 }
-
 
 /// Static delivery of published packages and index.toml. ETag carries the
 /// stored sha256 so clients can skip re-uploads of unchanged files.
@@ -887,7 +1017,10 @@ async fn repo_file(
     AxPath(path): AxPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if path.split('/').any(|seg| seg.is_empty() || seg == ".." || seg == ".") {
+    if path
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == ".." || seg == ".")
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     let full = state.config.repo_dir.join(&path);
@@ -910,18 +1043,17 @@ async fn repo_file(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|want| want.trim() == format!("\"{sha}\""))
         {
-            return (
-                StatusCode::NOT_MODIFIED,
-                [("etag", format!("\"{sha}\""))],
-            )
-                .into_response();
+            return (StatusCode::NOT_MODIFIED, [("etag", format!("\"{sha}\""))]).into_response();
         }
     }
 
     let file = match tokio::fs::File::open(&full).await {
         Ok(f) => f,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot open {}: {e}", path))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot open {}: {e}", path),
+            )
                 .into_response()
         }
     };
@@ -932,7 +1064,9 @@ async fn repo_file(
         builder = builder.header(header::ETAG, format!("\"{sha}\""));
     }
     let stream = tokio_util::io::ReaderStream::new(file);
-    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -950,21 +1084,11 @@ struct ApiStatusEntry {
     state: BuildState,
 }
 
-/// `amd64@<sha12> aarch64@<sha12>` style summary for the index page.
+/// Short HEAD of the canonical recipes tree for the index page.
 fn commits_summary(conn: &Connection) -> Result<String> {
-    let mut stmt = conn.prepare(
-        "SELECT key, value FROM meta WHERE key LIKE 'last_commit:%' ORDER BY key",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows
-        .iter()
-        .map(|(k, v)| format!("{}@{}", k.trim_start_matches("last_commit:"), &v[..12.min(v.len())]))
-        .collect::<Vec<_>>()
-        .join("  "))
+    Ok(db::meta_get(conn, "last_commit")?
+        .map(|v| format!("recipes@{}", &v[..12.min(v.len())]))
+        .unwrap_or_default())
 }
 
 async fn api_packages(State(app): State<SharedState>) -> Response {
@@ -988,8 +1112,11 @@ async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<Stri
         };
         let published_by_name = published_by_name(conn)?;
         let entry = {
-            let published =
-                pick_published(published_by_name.get(&name).map(Vec::as_slice), &pkg.arch, None);
+            let published = pick_published(
+                published_by_name.get(&name).map(Vec::as_slice),
+                &pkg.arch,
+                None,
+            );
             ApiStatusEntry {
                 name: pkg.name.clone(),
                 arch: pkg.arch.clone(),
@@ -1090,13 +1217,16 @@ pub async fn trigger_sync(state: SharedState, trigger: &'static str) -> Response
     let config = state.config.clone();
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = worker_state.db.lock().expect("sync worker: db mutex poisoned");
+        let conn = worker_state
+            .db
+            .lock()
+            .expect("sync worker: db mutex poisoned");
         sync::run_sync(&conn, &config, trigger)
     })
     .await;
     state.syncing.store(false, Ordering::SeqCst);
     match result {
-        Ok(Ok(count)) => (StatusCode::OK, format!("synced {count} recipes")).into_response(),
+        Ok(Ok(report)) => (StatusCode::OK, format!("synced: {}", report.summary())).into_response(),
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("sync failed: {err:#}"),

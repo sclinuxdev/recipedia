@@ -11,6 +11,16 @@ use crate::config::Config;
 use crate::db;
 use crate::status::{self, State as BuildState};
 
+/// A tool Sage configured and directly probed for a managed recipe-v2 build.
+/// Empty on v1 and upstream-prebuilt/repackaged archives.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManagedBuildTool {
+    pub role: String,
+    pub executable: String,
+    pub family: String,
+    pub version: String,
+}
+
 /// The `[package]` section of a package's `.METADATA/manifest.toml` — the
 /// authoritative description of an upload. Stored as JSON in the published
 /// table so index regeneration never re-reads archives.
@@ -31,29 +41,6 @@ pub struct ManifestMeta {
     pub arch: String,
     #[serde(default)]
     pub installed_size: i64,
-    // Build provenance, all optional.
-    #[serde(default)]
-    pub build_compiler: String,
-    #[serde(default)]
-    pub build_compiler_version: String,
-    #[serde(default)]
-    pub build_cflags: String,
-    #[serde(default)]
-    pub build_cxxflags: String,
-    #[serde(default)]
-    pub build_ldflags: String,
-    /// RUSTFLAGS actually handed to rustc (rust payloads, local builds).
-    #[serde(default)]
-    pub build_rustflags: String,
-    /// One entry per producer family the artifacts themselves name --
-    /// compilers and linkers alike ("clang 22.1.8", "lld 22.1.8"), with
-    /// switches verified from DWARF DW_AT_producer where present.
-    #[serde(default)]
-    pub build_producers: Vec<BuildProducer>,
-    /// Env channels the recipe forwarded flags through (KCFLAGS and kin):
-    /// annotation explaining injected-vs-verified flag agreement.
-    #[serde(default)]
-    pub build_flag_passthrough: Vec<String>,
     /// Raw universal service definition; non-empty marks a daemon package.
     #[serde(default)]
     pub service_toml: String,
@@ -63,16 +50,8 @@ pub struct ManifestMeta {
     pub provides: Vec<String>,
     #[serde(default)]
     pub conffiles: Vec<String>,
-}
-
-/// One `[[build_producers]]` row of the manifest.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BuildProducer {
-    pub name: String,
     #[serde(default)]
-    pub versions: Vec<String>,
-    #[serde(default)]
-    pub flags: String,
+    pub managed_build_tools: Vec<ManagedBuildTool>,
 }
 
 /// Server receipt for one publish, including the freshly derived build state.
@@ -154,6 +133,10 @@ pub fn read_file_list(archive: &Path) -> Result<Vec<db::FileLine>> {
 
 fn parse_manifest(text: &str) -> Result<ManifestMeta> {
     let doc: toml::Table = toml::from_str(text).context("manifest.toml is not valid TOML")?;
+    let schema_version = doc
+        .get("schema_version")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(1);
     let pkg = doc
         .get("package")
         .and_then(|v| v.as_table())
@@ -175,6 +158,58 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
             })
             .unwrap_or_default()
     };
+    let managed_build_tools = doc
+        .get("managed_build_tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|item| {
+                    let tool = item
+                        .as_table()
+                        .context("managed_build_tools entries must be tables")?;
+                    let value = |key: &str| {
+                        tool.get(key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let observed = ManagedBuildTool {
+                        role: value("role"),
+                        executable: value("executable"),
+                        family: value("family"),
+                        version: value("version"),
+                    };
+                    let version_argument = value("version_argument");
+                    let known = match observed.role.as_str() {
+                        "cc" | "cxx" => matches!(observed.family.as_str(), "gcc" | "clang"),
+                        "linker" => matches!(observed.family.as_str(), "ld" | "lld" | "mold"),
+                        "rustc" => observed.family == "rustc",
+                        _ => false,
+                    };
+                    if !known
+                        || observed.executable.is_empty()
+                        || observed.version.is_empty()
+                        || version_argument != "--version"
+                    {
+                        bail!("invalid managed_build_tools observation");
+                    }
+                    Ok(observed)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if !managed_build_tools.is_empty() && schema_version < 2 {
+        bail!("managed_build_tools are valid only in manifest schema v2");
+    }
+    let mut roles = std::collections::HashSet::new();
+    if managed_build_tools
+        .iter()
+        .any(|tool| !roles.insert(tool.role.as_str()))
+    {
+        bail!("managed_build_tools contains a duplicate role");
+    }
     let meta = ManifestMeta {
         name: s("name"),
         version: s("version"),
@@ -187,73 +222,16 @@ fn parse_manifest(text: &str) -> Result<ManifestMeta> {
         // state meets the recipe's canonical spelling.
         arch: crate::model::canonical_arch(&s("arch")).to_string(),
         installed_size: i("installed_size"),
-        build_compiler: s("build_compiler"),
-        build_compiler_version: s("build_compiler_version"),
-        build_cflags: s("build_cflags"),
-        build_cxxflags: s("build_cxxflags"),
-        build_ldflags: s("build_ldflags"),
-        build_rustflags: s("build_rustflags"),
         service_toml: s("service_toml"),
-        build_flag_passthrough: root_or_pkg_arr(&doc, pkg, "build_flag_passthrough"),
-        build_producers: producers(&doc, pkg),
         dependencies: arr("dependencies"),
         provides: arr("provides"),
         conffiles: arr("conffiles"),
+        managed_build_tools,
     };
     if meta.name.is_empty() || meta.version.is_empty() {
         bail!("manifest is missing name or version");
     }
     Ok(meta)
-}
-
-/// Root-scoped arrays with a fallback into `[package]`: early 0.2.x writers
-/// serialized `build_flag_passthrough` nested under the package table, so
-/// both spellings must parse forever.
-fn root_or_pkg_arr(doc: &toml::Table, pkg: &toml::Table, key: &str) -> Vec<String> {
-    [doc.get(key), pkg.get(key)]
-        .into_iter()
-        .find_map(|v| v.and_then(|v| v.as_array()))
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `[[build_producers]]`, same dual-scope tolerance as above.
-fn producers(doc: &toml::Table, pkg: &toml::Table) -> Vec<BuildProducer> {
-    [doc.get("build_producers"), pkg.get("build_producers")]
-        .into_iter()
-        .find_map(|v| v.and_then(|v| v.as_array()))
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_table())
-                .map(|t| BuildProducer {
-                    name: t
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    versions: t
-                        .get("versions")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    flags: t
-                        .get("flags")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .filter(|p| !p.name.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Land a fully-written, already-hashed temp file as a published package:
@@ -350,37 +328,20 @@ pub fn regenerate_index(conn: &rusqlite::Connection, cfg: &Config) -> Result<()>
         );
         out.push_str(&format!("installed_size = {}\n", m.installed_size));
         out.push_str(&format!("file = \"{}\"\n", escape(&row.filename)));
-        for (k, v) in [
-            ("build_compiler", &m.build_compiler),
-            ("build_compiler_version", &m.build_compiler_version),
-            ("build_cflags", &m.build_cflags),
-            ("build_cxxflags", &m.build_cxxflags),
-            ("build_ldflags", &m.build_ldflags),
-            ("build_rustflags", &m.build_rustflags),
-        ] {
-            if !v.is_empty() {
-                out.push_str(&format!("{k} = \"{}\"\n", escape(v)));
-            }
-        }
-        if !m.build_flag_passthrough.is_empty() {
-            push_array(&mut out, "build_flag_passthrough", &m.build_flag_passthrough);
-        }
-        for p in &m.build_producers {
-            out.push_str("[[build_producers]]\n");
-            out.push_str(&format!("name = \"{}\"\n", escape(&p.name)));
-            out.push_str("versions = [\n");
-            for v in &p.versions {
-                out.push_str(&format!("    \"{}\",\n", escape(v)));
-            }
-            out.push_str("]\n");
-            if !p.flags.is_empty() {
-                out.push_str(&format!("flags = \"{}\"\n", escape(&p.flags)));
-            }
-        }
         push_array(&mut out, "dependencies", &m.dependencies);
         push_array(&mut out, "provides", &m.provides);
         if !m.conffiles.is_empty() {
             push_array(&mut out, "conffiles", &m.conffiles);
+        }
+        for tool in &m.managed_build_tools {
+            out.push_str("[[packages.managed_build_tools]]\n");
+            let _ = (
+                w(&mut out, "role", &tool.role),
+                w(&mut out, "executable", &tool.executable),
+                w(&mut out, "family", &tool.family),
+                w(&mut out, "version", &tool.version),
+                w(&mut out, "version_argument", "--version"),
+            );
         }
         out.push('\n');
     }
@@ -434,45 +395,10 @@ mod arch_tests {
 
     #[test]
     fn manifest_arch_canonicalized() {
-        let text = "[package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"2\"\narch = \"x86_64\"\n";
+        let text =
+            "[package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"2\"\narch = \"x86_64\"\n";
         let meta = parse_manifest(text).unwrap();
         assert_eq!(meta.arch, "amd64");
-    }
-
-    #[test]
-    fn manifest_0_2_x_provenance() {
-        let text = "[package]\n\
-                    name = \"linux-zen\"\nversion = \"7.1.10\"\nrelease = \"3\"\narch = \"x86_64\"\n\
-                    build_rustflags = \"-C target-cpu=native\"\n\n\
-                    build_flag_passthrough = [\"KCFLAGS\", \"KAFLAGS\"]\n\n\
-                    [[build_producers]]\nname = \"clang\"\nversions = [\"22.1.8\"]\nflags = \"-O3 -march=x86-64-v3\"\n\n\
-                    [[build_producers]]\nname = \"lld\"\nversions = [\"22.1.8\"]\n";
-        let meta = parse_manifest(text).unwrap();
-        assert_eq!(meta.build_rustflags, "-C target-cpu=native");
-        assert_eq!(
-            meta.build_flag_passthrough,
-            vec!["KCFLAGS", "KAFLAGS"]
-        );
-        assert_eq!(meta.build_producers.len(), 2);
-        assert_eq!(meta.build_producers[0].name, "clang");
-        assert_eq!(meta.build_producers[0].versions, vec!["22.1.8"]);
-        assert_eq!(meta.build_producers[0].flags, "-O3 -march=x86-64-v3");
-        assert_eq!(meta.build_producers[1].name, "lld");
-        assert!(meta.build_producers[1].flags.is_empty());
-    }
-
-    #[test]
-    fn manifest_nested_legacy_scope() {
-        // Early 0.2.x writers nested these under [package]; both spellings
-        // must parse identically.
-        let text = "[package]\n\
-                    name = \"x\"\nversion = \"1\"\nrelease = \"1\"\narch = \"amd64\"\n\
-                    build_flag_passthrough = [\"KCFLAGS\"]\n\n\
-                    [[package.build_producers]]\nname = \"gcc\"\nversions = [\"15.3.0\", \"23\"]\n";
-        let meta = parse_manifest(text).unwrap();
-        assert_eq!(meta.build_flag_passthrough, vec!["KCFLAGS"]);
-        assert_eq!(meta.build_producers.len(), 1);
-        assert_eq!(meta.build_producers[0].versions.len(), 2);
     }
 }
 
@@ -501,5 +427,37 @@ mod tests {
     fn escaping() {
         assert_eq!(escape(r#"a"b\c"#), r#"a\"b\\c"#);
         assert_eq!(escape("\n"), "\\n");
+    }
+
+    #[test]
+    fn managed_v2_tools_are_archive_observations() {
+        let meta = parse_manifest(
+            r#"
+schema_version = 2
+[package]
+name = "v2-example"
+version = "1.0"
+release = "1"
+
+[[managed_build_tools]]
+role = "cc"
+executable = "/opt/toolchains/bin/clang"
+family = "clang"
+version = "22.1.8"
+version_argument = "--version"
+"#,
+        )
+        .unwrap();
+        assert_eq!(meta.managed_build_tools.len(), 1);
+        assert_eq!(
+            meta.managed_build_tools[0].executable,
+            "/opt/toolchains/bin/clang"
+        );
+        assert_eq!(meta.managed_build_tools[0].version, "22.1.8");
+
+        let prebuilt =
+            parse_manifest("[package]\nname = \"rust-bin\"\nversion = \"1.90\"\nrelease = \"1\"\n")
+                .unwrap();
+        assert!(prebuilt.managed_build_tools.is_empty());
     }
 }

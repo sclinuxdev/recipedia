@@ -4,14 +4,14 @@
 <h1>About Recipedia</h1>
 
 <p>Recipedia is the sclinux recipe &amp; repository hub: a read-only view of
-every recipes tree, cross-referenced against the published binary repository.
-Build state is derived on request — the recipes git trees and the published
+the canonical recipes tree, cross-referenced against the published binary repository.
+Build state is derived on request — the recipes git tree and the published
 table are the only sources of truth.</p>
 
 <h2>Serving build</h2>
 <table>
   <tr><th>Recipedia version</th><td class="mono">{{ version }}</td></tr>
-  <tr><th>Packages (recipes, all trees)</th><td class="mono">{{ recipe_count }}</td></tr>
+  <tr><th>Packages (canonical recipes tree)</th><td class="mono">{{ recipe_count }}</td></tr>
   <tr><th>Published artifacts</th><td class="mono">{{ published_count }}</td></tr>
   {% if let Some(s) = last_sync %}
   <tr><th>Last sync</th>
@@ -20,16 +20,13 @@ table are the only sources of truth.</p>
   {% endif %}
 </table>
 
-<h2>Recipe sources</h2>
+<h2>Recipe source</h2>
 <table>
-  <tr><th>Architecture</th><th>Tree</th><th>Synced HEAD</th></tr>
-  {% for s in sources %}
+  <tr><th>Tree</th><th>Synced HEAD</th></tr>
   <tr>
-    <td><span class="badge st-built">{{ s.arch }}</span></td>
-    <td class="mono"><a href="{{ s.url }}">{{ s.url }}</a></td>
-    <td class="mono">{{ s.commit }}</td>
+    <td class="mono"><a href="{{ source.url }}">{{ source.url }}</a></td>
+    <td class="mono">{{ source.commit }}</td>
   </tr>
-  {% endfor %}
 </table>
 
 <h2>Notes</h2>

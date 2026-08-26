@@ -58,7 +58,11 @@ fn numeric(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-pub fn derive(recipe_version: &str, recipe_release: &str, published: Option<(&str, &str)>) -> State {
+pub fn derive(
+    recipe_version: &str,
+    recipe_release: &str,
+    published: Option<(&str, &str)>,
+) -> State {
     let Some((pub_ver, pub_rel)) = published else {
         return State::Missing;
     };
@@ -79,8 +83,14 @@ mod tests {
     #[test]
     fn segment_ordering() {
         assert_eq!(compare_versions("1.10", "1.9"), std::cmp::Ordering::Greater);
-        assert_eq!(compare_versions("1.2.3", "1.2.3"), std::cmp::Ordering::Equal);
-        assert_eq!(compare_versions("22.1.8-2", "22.1.8-10"), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("22.1.8-2", "22.1.8-10"),
+            std::cmp::Ordering::Less
+        );
         assert_eq!(compare_versions("2.44", "2.9"), std::cmp::Ordering::Greater);
     }
 

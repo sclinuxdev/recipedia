@@ -19,6 +19,10 @@ pub struct Recipe {
     pub channel: String,
     pub source_url: String,
     pub source_sha256: String,
+    /// Optional upstream release feed/page and its capture regex. Both are
+    /// present or both are empty.
+    pub upstream_url: String,
+    pub upstream_version_regex: String,
     /// `[["name", "req"]]`-style pairs: request name split from constraint so
     /// reverse-dependency lookups stay exact.
     pub dependencies: Vec<Dep>,
@@ -108,6 +112,8 @@ impl Recipe {
         let mut build_dependencies = table_strings(&doc, "build_dependencies");
         let mut provides = table_strings(&doc, "provides");
         let mut conffiles = table_strings(&doc, "conffiles");
+        let mut upstream_url = pkg.and_then(|p| table_str(p, "upstream"));
+        let mut upstream_version_regex = pkg.and_then(|p| table_str(p, "upstream_regex"));
         for scope in [pkg]
             .into_iter()
             .flatten()
@@ -131,12 +137,71 @@ impl Recipe {
             conffiles.extend(table_strings(scope, "conffiles"));
         }
 
+        // Recipe v2 may identify the packages providing its default compiler
+        // and linker suite. Expose those as build dependencies just as Sage's
+        // parser does; executable selection remains Sage policy, not metadata.
+        if let Some(toolchain) = doc
+            .get("build")
+            .and_then(|v| v.as_table())
+            .and_then(|b| b.get("toolchain"))
+            .and_then(|v| v.as_table())
+        {
+            for kind in ["compiler", "linker", "rust"] {
+                let Some(tool) = toolchain.get(kind).and_then(|v| v.as_table()) else {
+                    if kind == "rust" {
+                        continue;
+                    }
+                    anyhow::bail!("build.toolchain requires a {kind} table");
+                };
+                let family = table_str(tool, "family")
+                    .with_context(|| format!("build.toolchain.{kind} has no family"))?;
+                let package = table_str(tool, "package")
+                    .with_context(|| format!("build.toolchain.{kind} has no package"))?;
+                let minimum = table_str(tool, "minimum_version")
+                    .with_context(|| format!("build.toolchain.{kind} has no minimum_version"))?;
+                let supported = match kind {
+                    "compiler" => matches!(family.as_str(), "clang" | "gcc"),
+                    "linker" => matches!(family.as_str(), "lld" | "mold" | "ld"),
+                    _ => family == "rustc",
+                };
+                anyhow::ensure!(
+                    supported,
+                    "unsupported build.toolchain.{kind} family '{family}'"
+                );
+                if kind == "rust" {
+                    let system = doc
+                        .get("build")
+                        .and_then(|v| v.as_table())
+                        .and_then(|b| table_str(b, "system"));
+                    anyhow::ensure!(
+                        system.as_deref() == Some("cargo"),
+                        "build.toolchain.rust is valid only for Cargo recipes"
+                    );
+                }
+                if !build_dependencies
+                    .iter()
+                    .any(|raw| parse_dep(raw).name == package)
+                {
+                    build_dependencies.push(format!("{package} >= {minimum}"));
+                }
+            }
+        }
+
         // The loop's last-writer-wins chain would let the final [[source]]
         // element override earlier ones; re-apply element zero so the primary
         // archive's url/sha256 always win.
         if let Some(primary) = source_scopes.first() {
             source_url = table_str(primary, "url").or(source_url);
             source_sha256 = table_str(primary, "sha256").or(source_sha256);
+        }
+
+        if let Some(upstream) = doc.get("upstream").and_then(|v| v.as_table()) {
+            upstream_url = table_str(upstream, "url").or(upstream_url);
+            upstream_version_regex =
+                table_str(upstream, "version_regex").or(upstream_version_regex);
+        }
+        if upstream_url.is_some() != upstream_version_regex.is_some() {
+            anyhow::bail!("upstream tracking requires both url and version_regex");
         }
 
         let name = name.context("recipe has no name")?;
@@ -151,6 +216,8 @@ impl Recipe {
             arch: arch.unwrap_or_default(),
             source_url: source_url.unwrap_or_default(),
             source_sha256: source_sha256.unwrap_or_default(),
+            upstream_url: upstream_url.unwrap_or_default(),
+            upstream_version_regex: upstream_version_regex.unwrap_or_default(),
             dependencies: dependencies.iter().map(|s| parse_dep(s)).collect(),
             build_dependencies: build_dependencies.iter().map(|s| parse_dep(s)).collect(),
             provides,
@@ -225,5 +292,50 @@ mod tests {
             "https://ftpmirror.gnu.org/gnu/bash/bash-5.3.tar.gz"
         );
         assert_eq!(r.source_sha256, "aaa");
+    }
+
+    #[test]
+    fn v2_upstream_table_and_issue_compatibility_spelling() {
+        let preferred = Recipe::from_toml(
+            "schema_version = 2\n\
+             [package]\nname = \"zlib\"\nversion = \"1.3.2\"\n\
+             [upstream]\nurl = \"https://zlib.net/\"\nversion_regex = 'zlib-(\\d+\\.\\d+\\.\\d+)'\n\
+             [build]\nsystem = \"cmake\"\n\
+             [build.toolchain.compiler]\nfamily = \"clang\"\npackage = \"clang\"\nminimum_version = \"22\"\n\
+             [build.toolchain.linker]\nfamily = \"lld\"\npackage = \"lld\"\nminimum_version = \"22\"\n",
+        )
+        .unwrap();
+        assert_eq!(preferred.upstream_url, "https://zlib.net/");
+        assert_eq!(preferred.upstream_version_regex, r"zlib-(\d+\.\d+\.\d+)");
+        assert!(preferred
+            .build_dependencies
+            .iter()
+            .any(|d| d.name == "clang" && d.req == ">= 22"));
+        assert!(preferred
+            .build_dependencies
+            .iter()
+            .any(|d| d.name == "lld" && d.req == ">= 22"));
+
+        let cargo = Recipe::from_toml(
+            "schema_version = 2\n\
+             [package]\nname = \"cargo-example\"\nversion = \"1\"\n\
+             [build]\nsystem = \"cargo\"\n\
+             [build.toolchain.compiler]\nfamily = \"clang\"\npackage = \"clang\"\nminimum_version = \"22\"\n\
+             [build.toolchain.linker]\nfamily = \"lld\"\npackage = \"lld\"\nminimum_version = \"22\"\n\
+             [build.toolchain.rust]\nfamily = \"rustc\"\npackage = \"rust\"\nminimum_version = \"1.90\"\n",
+        )
+        .unwrap();
+        assert!(cargo
+            .build_dependencies
+            .iter()
+            .any(|d| d.name == "rust" && d.req == ">= 1.90"));
+
+        let compatible = Recipe::from_toml(
+            "[package]\nname = \"zlib\"\nversion = \"1.3.2\"\n\
+             upstream = \"https://zlib.net/\"\nupstream_regex = 'v(\\d+)'\n",
+        )
+        .unwrap();
+        assert_eq!(compatible.upstream_url, "https://zlib.net/");
+        assert_eq!(compatible.upstream_version_regex, r"v(\d+)");
     }
 }

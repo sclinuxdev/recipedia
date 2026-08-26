@@ -1,7 +1,7 @@
 # Recipedia
 
-sclinux recipe & repository hub — a read-only web presentation of the
-[sclinuxdev/recipes](https://github.com/sclinuxdev/recipes.amd64) git tree, plus
+sclinux recipe & repository hub — a read-only web presentation of the canonical
+[sclinuxdev/recipes](https://github.com/sclinuxdev/recipes) git tree, plus
 built-in hosting of published binary packages.
 
 ## What it does
@@ -38,21 +38,45 @@ recipedia status --state missing
 ```
 
 Configuration is environment-only: `RECIPEEDIA_LISTEN`, `RECIPEEDIA_DB`,
-`RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URLS` (comma-separated `arch=url`
-pairs; default aggregates recipes.amd64 + recipes.aarch64; legacy singular
-`RECIPEEDIA_GIT_URL` still works), `RECIPEEDIA_WEBHOOK_SECRET`,
+`RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URL` (one canonical repository;
+defaults to `https://github.com/sclinuxdev/recipes`), `RECIPEEDIA_WEBHOOK_SECRET`,
 `RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_REPO_URL` (public repo domain for
 frontend file links; unset keeps same-origin `/repo/...`).
 
+The canonical tree layout is
+`<category>/<name>/<arch>/<name>-<version>-<release>/recipe.toml`. A sync diffs
+the previous and new commits and reports the architectures touched (`amd64`,
+`aarch64`, `any`) in both the webhook response and sync log.
+
 ## Deploying (Docker / 1Panel)
 
-The repo ships a `Dockerfile` (multi-stage musl build, runtime image is
-alpine + git only) and a `compose.yaml`. On a 1Panel box: 容器 → 编排 →
-创建编排, paste `compose.yaml` as-is — it builds from this GitHub repo,
-binds `127.0.0.1:8300` on the host and keeps all state in the compose
-directory's `data/`. Then 网站 → 创建网站 → 反向代理 to `127.0.0.1:8300`
-for public HTTPS. Mint publish tokens with
-`docker exec recipedia recipedia-server token <label>`.
+The `Dockerfile` is a small Ubuntu 24.04 runtime image: it downloads the
+matching x86_64 glibc binaries from GitHub Releases instead of compiling on
+the server. Build it only after that release exists:
+
+```sh
+docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.3 \
+  -t recipedia:0.1.3 -t recipedia:latest \
+  https://github.com/sclinuxdev/recipedia.git#v0.1.3
+install -d -m 0750 /srv/recipedia
+RECIPEEDIA_DATA_DIR=/srv/recipedia docker compose up -d --force-recreate
+docker exec recipedia recipedia-server token <label>
+```
+
+For 1Panel, run the `docker build` command in the server terminal first, then
+open 容器 → 编排 → 创建编排 and paste `compose.yaml`. Set
+`RECIPEEDIA_DATA_DIR=/srv/recipedia` in the compose environment so removing or
+moving the compose project cannot remove SQLite, the git mirror, packages, or
+logs. Create a reverse proxy from the public site to `127.0.0.1:8300`; if using
+the split domains shown in `compose.yaml`, proxy the repository domain to
+`http://127.0.0.1:8300/repo/` with the trailing slash. Configure the GitHub
+webhook payload URL as `https://<frontend>/api/webhook/github`, content type
+`application/json`, and use the same secret as `RECIPEEDIA_WEBHOOK_SECRET`.
+
+To upgrade, replace `0.1.3` with the new release in the build command, retag
+`recipedia:latest`, and run `docker compose up -d --force-recreate` again. The
+mounted data directory is reused and the disposable recipe cache is rebuilt
+from the canonical git source.
 
 ## Build
 

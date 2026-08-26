@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -43,7 +43,11 @@ pub fn update_mirror(git_url: &str, git_dir: &Path) -> Result<String> {
 /// Remote HEAD SHA without touching the mirror -- the poll loop's cheap
 /// "did anything change" probe.
 pub fn remote_head(git_url: &str) -> Result<String> {
-    let out = run(Path::new("."), "git", &["ls-remote", git_url, "refs/heads/main"])?;
+    let out = run(
+        Path::new("."),
+        "git",
+        &["ls-remote", git_url, "refs/heads/main"],
+    )?;
     let sha = out
         .split_whitespace()
         .next()
@@ -51,19 +55,34 @@ pub fn remote_head(git_url: &str) -> Result<String> {
     Ok(sha.to_string())
 }
 
-/// Walk every recipe.toml under the mirror and parse it. Both tree shapes are
-/// accepted: the current flat `<name>/<ver>-<rel>/recipe.toml` (category
-/// `misc`) and the nine-category `<cat>/<name>/<ver>-<rel>/recipe.toml`.
+/// Architectures touched between two canonical-tree commits. The architecture
+/// is structural (`<category>/<name>/<arch>/...`), so this remains accurate
+/// even when a recipe was deleted and is no longer available to parse.
+fn changed_arches(git_dir: &Path, previous: Option<&str>, current: &str) -> Result<Vec<String>> {
+    let paths = match previous {
+        Some(old) if old == current => String::new(),
+        Some(old) => run(git_dir, "git", &["diff", "--name-only", old, current])?,
+        None => run(git_dir, "git", &["ls-tree", "-r", "--name-only", current])?,
+    };
+    Ok(arches_from_paths(&paths))
+}
+
+fn arches_from_paths(paths: &str) -> Vec<String> {
+    let mut arches = BTreeSet::new();
+    for path in paths.lines() {
+        let parts: Vec<_> = path.split('/').collect();
+        if parts.len() >= 3 && CATEGORIES.contains(&parts[0]) {
+            arches.insert(canonical_arch(parts[2]).to_string());
+        }
+    }
+    arches.into_iter().collect()
+}
+
+/// Walk every recipe.toml under the canonical mirror. Its single-source layout
+/// is `<category>/<name>/<arch>/<name>-<version>-<release>/recipe.toml`.
 /// A package may keep several version directories side by side; only a true
 /// collision (same name+version+release in two places) is rejected.
-/// Walk one tree. The status key gains an arch dimension: the effective
-/// architecture is the declared `arch` (canonicalized) when present, else the
-/// tree's own -- so an undeclared recipe in recipes.aarch64 is aarch64.
-pub fn collect_recipes(
-    git_dir: &Path,
-    source_arch: &str,
-    origin_url: &str,
-) -> Result<Vec<RecipeRecord>> {
+pub fn collect_recipes(git_dir: &Path, origin_url: &str) -> Result<Vec<RecipeRecord>> {
     let mut out: BTreeMap<(String, String, String, String), RecipeRecord> = BTreeMap::new();
     let mut stack = vec![git_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -77,12 +96,6 @@ pub fn collect_recipes(
                 stack.push(path);
             } else if path.file_name().is_some_and(|n| n == "recipe.toml") {
                 let mut record = parse_recipe_at(git_dir, &path)?;
-                let eff = if record.recipe.arch.is_empty() {
-                    source_arch.to_string()
-                } else {
-                    record.recipe.arch.clone()
-                };
-                record.arch = canonical_arch(&eff).to_string();
                 record.origin = origin_url.to_string();
                 let key = (
                     record.recipe.name.clone(),
@@ -120,21 +133,44 @@ fn parse_recipe_at(git_dir: &Path, path: &Path) -> Result<RecipeRecord> {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    // <cat>/<name>/<ver>/recipe.toml vs <name>/<ver>/recipe.toml
-    let (category, recipe_path) = match components.as_slice() {
-        [cat, name, ver, file] if CATEGORIES.contains(&cat.as_str()) => {
-            (cat.clone(), format!("{cat}/{name}/{ver}/{file}"))
-        }
-        [name, ver, file] => ("misc".to_string(), format!("{name}/{ver}/{file}")),
+    let (category, path_name, path_arch, identity, recipe_path) = match components.as_slice() {
+        [cat, name, arch, identity, file] if CATEGORIES.contains(&cat.as_str()) => (
+            cat.clone(),
+            name.clone(),
+            canonical_arch(arch).to_string(),
+            identity.clone(),
+            format!("{cat}/{name}/{arch}/{identity}/{file}"),
+        ),
         other => bail!("unexpected recipe layout: {}", other.join("/")),
     };
     let text = std::fs::read_to_string(path)?;
-    let recipe = Recipe::from_toml(&text)
-        .with_context(|| format!("parsing {rel}"))?;
+    let recipe = Recipe::from_toml(&text).with_context(|| format!("parsing {rel}"))?;
+    if recipe.name != path_name {
+        bail!(
+            "recipe name '{}' does not match path package '{}' at {rel}",
+            recipe.name,
+            path_name
+        );
+    }
+    if recipe.arch.is_empty() {
+        bail!("recipe must declare arch matching its single-tree path at {rel}");
+    }
+    if canonical_arch(&recipe.arch) != path_arch {
+        bail!(
+            "recipe arch '{}' does not match path arch '{}' at {rel}",
+            recipe.arch,
+            path_arch
+        );
+    }
+    let expected_identity = format!("{}-{}-{}", recipe.name, recipe.version, recipe.release);
+    if identity != expected_identity {
+        bail!(
+            "recipe identity '{expected_identity}' does not match directory '{identity}' at {rel}"
+        );
+    }
     Ok(RecipeRecord {
         recipe,
-        // Filled in by the caller once the source tree's arch/commit bind.
-        arch: String::new(),
+        arch: path_arch,
         origin: String::new(),
         category,
         recipe_path,
@@ -158,62 +194,105 @@ fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Full sync cycle across every configured tree: update each mirror, parse,
-/// then atomically swap the cache table once for the combined world.
-pub fn run_sync(conn: &rusqlite::Connection, config: &Config, trigger: &str) -> Result<usize> {
+/// Full sync cycle from the one canonical tree, then atomically swap the cache.
+#[derive(Debug, Clone)]
+pub struct SyncReport {
+    pub count: usize,
+    pub changed_arches: Vec<String>,
+}
+
+impl SyncReport {
+    pub fn summary(&self) -> String {
+        let changed = if self.changed_arches.is_empty() {
+            "none".to_string()
+        } else {
+            self.changed_arches.join(", ")
+        };
+        format!("{} recipes; changed architectures: {changed}", self.count)
+    }
+}
+
+pub fn run_sync(conn: &rusqlite::Connection, config: &Config, trigger: &str) -> Result<SyncReport> {
     let started = db::now();
     let result = sync_inner(conn, config);
     match &result {
-        Ok((commits, count)) => {
-            let summary = format!("{count} recipes from {} trees", commits.len());
-            db::log_sync(conn, trigger, &commits.join(","), started, true, &summary)?;
+        Ok((commit, report)) => {
+            db::log_sync(conn, trigger, commit, started, true, &report.summary())?;
         }
         Err(err) => {
             db::log_sync(conn, trigger, "", started, false, &format!("{err:#}"))?;
         }
     }
-    result.map(|(_, count)| count)
+    result.map(|(_, report)| report)
 }
 
-fn sync_inner(conn: &rusqlite::Connection, config: &Config) -> Result<(Vec<String>, usize)> {
-    // Identity for cross-tree dedup: an `arch = "any"` recipe published in
-    // both trees is ONE package (same artifact serves every arch), so exact
-    // duplicates collapse. Anything differing in name/arch/version/release
-    // stays its own row.
-    let mut records: Vec<RecipeRecord> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String, String, String)> =
-        std::collections::HashSet::new();
-    let mut commits = Vec::new();
-    for source in &config.git_sources {
-        let git_dir = config.git_dir(&source.arch);
-        let commit = update_mirror(&source.url, &git_dir)?;
-        let mut tree = collect_recipes(&git_dir, &source.arch, &source.url)?;
-        for r in &mut tree {
-            r.git_commit = commit.clone();
-        }
-        commits.push(format!("{}@{}", source.arch, &commit[..12.min(commit.len())]));
-        db::meta_set(conn, &format!("last_commit:{}", source.arch), &commit)?;
-        for record in tree {
-            let key = (
-                record.recipe.name.clone(),
-                record.arch.clone(),
-                record.recipe.version.clone(),
-                record.recipe.release.clone(),
-            );
-            if !seen.insert(key) {
-                if record.recipe.arch == "any" {
-                    continue; // identical any-package shipped by both trees
-                }
-                bail!(
-                    "conflicting package '{}-{}-{}' across trees",
-                    record.recipe.name,
-                    record.recipe.version,
-                    record.recipe.release
-                );
-            }
-            records.push(record);
-        }
+fn sync_inner(conn: &rusqlite::Connection, config: &Config) -> Result<(String, SyncReport)> {
+    let git_dir = config.git_dir();
+    let previous = db::meta_get(conn, "last_commit")?;
+    let commit = update_mirror(&config.git_url, &git_dir)?;
+    let changed_arches = changed_arches(&git_dir, previous.as_deref(), &commit)
+        .context("determining changed architectures")?;
+    let mut records = collect_recipes(&git_dir, &config.git_url)?;
+    for record in &mut records {
+        record.git_commit = commit.clone();
     }
+    db::meta_set(conn, "last_commit", &commit)?;
+    db::meta_set(conn, "last_changed_arches", &changed_arches.join(","))?;
     db::rebuild_packages(conn, &records)?;
-    Ok((commits, records.len()))
+    let count = records.len();
+    Ok((
+        commit,
+        SyncReport {
+            count,
+            changed_arches,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_architectures_come_from_canonical_paths() {
+        assert_eq!(
+            arches_from_paths(
+                "devel/gcc/amd64/gcc-16.2.0-1/recipe.toml\n\
+                 system/base/any/base-1.0.0-1/recipe.toml\n\
+                 lib/zlib/aarch64/zlib-1.3.2-2/service.toml\n\
+                 README.md\n"
+            ),
+            ["aarch64", "amd64", "any"]
+        );
+    }
+
+    #[test]
+    fn collector_requires_the_single_tree_identity() {
+        let root =
+            std::env::temp_dir().join(format!("recipedia-single-tree-{}", std::process::id()));
+        let recipe_dir = root.join("devel/demo/amd64/demo-1.2.3-4");
+        std::fs::create_dir_all(&recipe_dir).unwrap();
+        std::fs::write(
+            recipe_dir.join("recipe.toml"),
+            r#"schema_version = 1
+[package]
+name = "demo"
+version = "1.2.3"
+release = "4"
+description = "demo"
+license = "MIT"
+channel = "system"
+arch = "amd64"
+"#,
+        )
+        .unwrap();
+        let records = collect_recipes(&root, "https://example.invalid/recipes").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].arch, "amd64");
+        assert_eq!(
+            records[0].recipe_path,
+            "devel/demo/amd64/demo-1.2.3-4/recipe.toml"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

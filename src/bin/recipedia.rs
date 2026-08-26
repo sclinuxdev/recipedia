@@ -14,7 +14,9 @@ use sha2::Digest;
 fn client_config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
     base.join("recipedia").join("config.toml")
 }
 
@@ -27,8 +29,12 @@ struct ClientConfig {
 impl ClientConfig {
     fn load() -> Result<Self> {
         let path = client_config_path();
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("no client config — run `recipedia login` first ({})", path.display()))?;
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "no client config — run `recipedia login` first ({})",
+                path.display()
+            )
+        })?;
         let tbl: toml::Table = toml::from_str(&text)?;
         Ok(Self {
             url: tbl
@@ -159,7 +165,10 @@ fn publish(args: Vec<String>) -> Result<()> {
     let mut uploaded = 0usize;
     let mut uptodate = 0usize;
     for file in &files {
-        let filename = file.file_name().and_then(|n| n.to_str()).context("bad filename")?;
+        let filename = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("bad filename")?;
         let local_sha = sha256_file(file)?;
         // Server ETag is the stored sha256; matching means it already has this exact file.
         let head = ureq::head(format!("{}/repo/{filename}", cfg.url).as_str())
@@ -196,7 +205,10 @@ fn publish(args: Vec<String>) -> Result<()> {
         attach_build_log(&cfg, file, filename);
         uploaded += 1;
     }
-    println!("{uploaded} uploaded, {uptodate} up-to-date, {} total", files.len());
+    println!(
+        "{uploaded} uploaded, {uptodate} up-to-date, {} total",
+        files.len()
+    );
     Ok(())
 }
 
@@ -209,7 +221,10 @@ fn attach_build_log(cfg: &ClientConfig, archive: &Path, filename: &str) {
         return;
     };
     if content.len() > 1024 * 1024 {
-        println!("  · build log skipped ({} exceeds 1 MiB)", log_path.display());
+        println!(
+            "  · build log skipped ({} exceeds 1 MiB)",
+            log_path.display()
+        );
         return;
     }
     match ureq::post(format!("{}/api/repo/publish/{filename}/log", cfg.url).as_str())

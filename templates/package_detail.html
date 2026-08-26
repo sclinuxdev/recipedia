@@ -26,14 +26,17 @@
   {% if !pkg.source_sha256.is_empty() %}
   <tr><th>Source sha256</th><td class="mono">{{ pkg.source_sha256 }}</td></tr>
   {% endif %}
+  {% if !pkg.upstream_url.is_empty() %}
+  <tr><th>Upstream</th><td class="mono"><a href="{{ pkg.upstream_url }}">{{ pkg.upstream_url }}</a></td></tr>
+  <tr><th>Upstream version regex</th><td class="mono">{{ pkg.upstream_version_regex }}</td></tr>
+  {% endif %}
   <tr><th>Recipe</th><td class="mono"><a href="{{ github_url }}">{{ pkg.recipe_path }}</a></td></tr>
 </table>
 
 {% if !published.is_empty() %}
 <h2>Published builds</h2>
-<p class="muted">The compiler column reflects the stamps recorded by <code>sage build</code> — it appears only when the build produced compilation evidence, so data-only packages show none.</p>
 <table>
-  <tr><th>Version</th><th>Arch</th><th>Builder</th><th>File</th><th>Size</th><th>Published</th><th>Built with</th></tr>
+  <tr><th>Version</th><th>Arch</th><th>Builder</th><th>File</th><th>Size</th><th>Published</th></tr>
   {% for p in published %}
   <tr>
     <td class="mono">{{ p.version }}-{{ p.release }}</td>
@@ -42,26 +45,23 @@
     <td class="mono"><a href="{{ nav.repo }}/{{ p.filename }}">{{ p.filename }}</a></td>
     <td class="mono muted">{{ p.size_mib() }} MiB</td>
     <td class="mono muted"><time class="ts" datetime="{{ p.built_iso() }}">{{ p.built_at() }}</time></td>
-    {% if p.has_build_info() %}
-    <td class="mono">
-      {% if !p.compiler_line().is_empty() %}{{ p.compiler_line() }}{% endif %}
-      {% if !p.flag_lines().is_empty() || !p.producer_flag_lines().is_empty() %}
-      <details><summary>flags</summary>
-        {% for f in p.producer_flag_lines() %}
-        <div><span class="muted">verified</span> {{ f.label }} <span class="mono">{{ f.value }}</span></div>
-        {% endfor %}
-        {% for f in p.flag_lines() %}
-        <div>{{ f.label }} <span class="mono">{{ f.value }}</span></div>
-        {% endfor %}
-        {% if !p.passthrough_channels().is_empty() %}
-        <div class="muted">passthrough: {% for c in p.passthrough_channels() %}<span class="mono">{{ c }}</span>{{ " " }}{% endfor %}</div>
-        {% endif %}
-      </details>
-      {% endif %}
-    </td>
-    {% else %}
-    <td class="muted">—</td>
-    {% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if !managed_build_tools.is_empty() %}
+<h2>Sage-managed build tools</h2>
+<p class="muted">Recorded from the executables configured by Sage for this published recipe-v2 build.</p>
+<table>
+  <tr><th>Role</th><th>Executable</th><th>Family</th><th>Observed version</th><th>Version source</th></tr>
+  {% for tool in managed_build_tools %}
+  <tr>
+    <td class="mono">{{ tool.role }}</td>
+    <td class="mono">{{ tool.executable }}</td>
+    <td class="mono">{{ tool.family }}</td>
+    <td class="mono">{{ tool.version }}</td>
+    <td class="mono">{{ tool.executable }} --version</td>
   </tr>
   {% endfor %}
 </table>

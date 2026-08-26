@@ -12,6 +12,8 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS packages (
   name            TEXT PRIMARY KEY,
+  arch            TEXT NOT NULL,
+  origin          TEXT NOT NULL,
   category        TEXT NOT NULL,
   version         TEXT NOT NULL,
   release         TEXT NOT NULL,
@@ -24,6 +26,8 @@ CREATE TABLE IF NOT EXISTS packages (
   conffiles       TEXT NOT NULL,   -- JSON array of strings
   source_url      TEXT NOT NULL,
   source_sha256   TEXT NOT NULL,
+  upstream_url    TEXT NOT NULL,
+  upstream_version_regex TEXT NOT NULL,
   recipe_path     TEXT NOT NULL,   -- repo-relative, links to GitHub raw
   git_commit      TEXT NOT NULL,
   synced_at       INTEGER NOT NULL
@@ -84,28 +88,31 @@ CREATE TABLE IF NOT EXISTS build_logs (
 
 pub fn open(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("cannot create database directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create database directory {}", parent.display()))?;
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("cannot open database at {}", db_path.display()))?;
     conn.execute_batch(SCHEMA)?;
     // Databases created before P3 lack the published.meta column.
-    let _ = conn.execute("ALTER TABLE published ADD COLUMN meta TEXT NOT NULL DEFAULT ''", []);
-    // Databases created before multi-arch support have a packages table
-    // without the arch/origin columns. It is a disposable cache: drop it and
-    // let the next sync rebuild the new shape.
-    let has_arch: bool = conn
+    let _ = conn.execute(
+        "ALTER TABLE published ADD COLUMN meta TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    // The recipes table is a disposable cache. Drop older shapes and let the
+    // next sync rebuild them instead of carrying schema-migration branches.
+    let has_current_shape: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'arch'",
+            "SELECT COUNT(*) FROM pragma_table_info('packages')
+             WHERE name IN ('arch', 'origin', 'upstream_url', 'upstream_version_regex')",
             [],
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
-        > 0;
-    if !has_arch {
-        let _ = conn.execute("DROP TABLE IF EXISTS packages", []);
+        == 4;
+    if !has_current_shape {
+        conn.execute("DROP TABLE IF EXISTS packages", [])?;
+        conn.execute_batch(SCHEMA)?;
     }
     Ok(conn)
 }
@@ -113,10 +120,9 @@ pub fn open(db_path: &Path) -> Result<Connection> {
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageRow {
     pub name: String,
-    /// Effective architecture: the declared `arch` canonicalized, falling
-    /// back to the tree's architecture when undeclared.
+    /// Architecture declared by the recipe and mirrored in its path.
     pub arch: String,
-    /// URL of the recipes tree this row was parsed from (GitHub links).
+    /// URL of the canonical recipes tree (GitHub links).
     pub origin: String,
     pub category: String,
     pub version: String,
@@ -130,6 +136,8 @@ pub struct PackageRow {
     pub conffiles: Vec<String>,
     pub source_url: String,
     pub source_sha256: String,
+    pub upstream_url: String,
+    pub upstream_version_regex: String,
     pub recipe_path: String,
 }
 
@@ -145,8 +153,7 @@ pub struct PublishedRow {
     /// Who published this build (token label from the upload).
     pub builder: String,
     pub uploaded_at: i64,
-    /// Manifest meta stored at publish time; carries the build-provenance
-    /// stamps (compiler, flags) when the builder recorded any.
+    /// Manifest metadata stored at publish time.
     pub meta: Option<crate::repo::ManifestMeta>,
 }
 
@@ -200,6 +207,8 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
              conffiles       TEXT NOT NULL,
              source_url      TEXT NOT NULL,
              source_sha256   TEXT NOT NULL,
+             upstream_url    TEXT NOT NULL,
+             upstream_version_regex TEXT NOT NULL,
              recipe_path     TEXT NOT NULL,
              git_commit      TEXT NOT NULL,
              synced_at       INTEGER NOT NULL
@@ -208,8 +217,8 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
     let mut stmt = conn.prepare(
         "INSERT INTO packages_new (name, arch, origin, category, version, release, description, license,
              channel, provides, dependencies, build_deps, conffiles, source_url, source_sha256,
-             recipe_path, git_commit, synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             upstream_url, upstream_version_regex, recipe_path, git_commit, synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
     )?;
     for r in recipes {
         stmt.execute(params![
@@ -228,6 +237,8 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
             serde_json::to_string(&r.recipe.conffiles)?,
             r.recipe.source_url,
             r.recipe.source_sha256,
+            r.recipe.upstream_url,
+            r.recipe.upstream_version_regex,
             r.recipe_path,
             r.git_commit,
             now,
@@ -246,9 +257,9 @@ pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<(
 #[derive(Debug, Clone)]
 pub struct RecipeRecord {
     pub recipe: Recipe,
-    /// Effective architecture (declared arch, else the tree's).
+    /// Architecture declared by the recipe and mirrored in its path.
     pub arch: String,
-    /// URL of the recipes tree this record came from.
+    /// URL of the canonical recipes tree.
     pub origin: String,
     pub category: String,
     pub recipe_path: String,
@@ -258,9 +269,14 @@ pub struct RecipeRecord {
 
 const PACKAGE_COLS: &str =
     "name, arch, origin, category, version, release, description, license, channel,
-     provides, dependencies, build_deps, conffiles, source_url, source_sha256, recipe_path";
+     provides, dependencies, build_deps, conffiles, source_url, source_sha256,
+     upstream_url, upstream_version_regex, recipe_path";
 
-fn select_packages(conn: &Connection, where_clause: &str, name: Option<&str>) -> Result<Vec<PackageRow>> {
+fn select_packages(
+    conn: &Connection,
+    where_clause: &str,
+    name: Option<&str>,
+) -> Result<Vec<PackageRow>> {
     let sql = format!("SELECT {PACKAGE_COLS} FROM packages {where_clause}");
     let mut stmt = conn.prepare(&sql)?;
     let rows = match name {
@@ -282,11 +298,7 @@ pub fn all_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
 pub fn latest_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
     let mut rows = all_packages(conn)?;
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then(a.arch.cmp(&b.arch))
-    });
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.arch.cmp(&b.arch)));
     rows.dedup_by(|a, b| {
         if a.name == b.name && a.arch == b.arch {
             // `a` precedes `b`; keep whichever sorts newer under the same
@@ -434,7 +446,10 @@ pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<Published
 }
 
 /// Stored manifest meta for one archive (empty JSON → None).
-pub fn published_meta(conn: &Connection, filename: &str) -> Result<Option<crate::repo::ManifestMeta>> {
+pub fn published_meta(
+    conn: &Connection,
+    filename: &str,
+) -> Result<Option<crate::repo::ManifestMeta>> {
     let mut stmt = conn.prepare("SELECT meta FROM published WHERE filename = ?1")?;
     let mut rows = stmt.query_map(params![filename], |r| r.get::<_, String>(0))?;
     match rows.next().transpose()? {
@@ -565,8 +580,15 @@ pub struct FileLine {
 }
 
 /// Swap the stored file list for one archive; called on every publish.
-pub fn replace_published_files(conn: &Connection, filename: &str, lines: &[FileLine]) -> Result<()> {
-    conn.execute("DELETE FROM published_files WHERE filename = ?1", params![filename])?;
+pub fn replace_published_files(
+    conn: &Connection,
+    filename: &str,
+    lines: &[FileLine],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM published_files WHERE filename = ?1",
+        params![filename],
+    )?;
     let mut stmt = conn.prepare(
         "INSERT INTO published_files (filename, path, type, size) VALUES (?1, ?2, ?3, ?4)",
     )?;
@@ -583,7 +605,11 @@ pub fn file_list(conn: &Connection, filename: &str) -> Result<Vec<FileLine>> {
     )?;
     let rows = stmt
         .query_map(params![filename], |r| {
-            Ok(FileLine { path: r.get(0)?, kind: r.get(1)?, size: r.get(2)? })
+            Ok(FileLine {
+                path: r.get(0)?,
+                kind: r.get(1)?,
+                size: r.get(2)?,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -610,7 +636,11 @@ pub fn log_get(conn: &Connection, filename: &str) -> Result<Option<LogRow>> {
     let mut stmt =
         conn.prepare("SELECT content, builder, uploaded_at FROM build_logs WHERE filename = ?1")?;
     let mut rows = stmt.query_map(params![filename], |r| {
-        Ok(LogRow { content: r.get(0)?, builder: r.get(1)?, uploaded_at: r.get(2)? })
+        Ok(LogRow {
+            content: r.get(0)?,
+            builder: r.get(1)?,
+            uploaded_at: r.get(2)?,
+        })
     })?;
     Ok(rows.next().transpose()?)
 }
@@ -619,12 +649,21 @@ pub fn log_get(conn: &Connection, filename: &str) -> Result<Option<LogRow>> {
 /// Returns false when the filename was never published. The on-disk file and
 /// index regeneration are the caller's job (they own repo_dir).
 pub fn delete_published(conn: &Connection, filename: &str) -> Result<bool> {
-    let affected = conn.execute("DELETE FROM published WHERE filename = ?1", params![filename])?;
+    let affected = conn.execute(
+        "DELETE FROM published WHERE filename = ?1",
+        params![filename],
+    )?;
     if affected == 0 {
         return Ok(false);
     }
-    conn.execute("DELETE FROM published_files WHERE filename = ?1", params![filename])?;
-    conn.execute("DELETE FROM build_logs WHERE filename = ?1", params![filename])?;
+    conn.execute(
+        "DELETE FROM published_files WHERE filename = ?1",
+        params![filename],
+    )?;
+    conn.execute(
+        "DELETE FROM build_logs WHERE filename = ?1",
+        params![filename],
+    )?;
     Ok(true)
 }
 
@@ -667,12 +706,6 @@ impl SyncEntry {
     }
 }
 
-/// One renderable build-flag line of the provenance block.
-pub struct FlagLine {
-    pub label: String,
-    pub value: String,
-}
-
 impl PublishedRow {
     /// When this build landed in the repository (template helper).
     pub fn built_at(&self) -> String {
@@ -686,105 +719,6 @@ impl PublishedRow {
     /// Archive size in MiB, one decimal (template helper).
     pub fn size_mib(&self) -> String {
         format!("{:.1}", self.size as f64 / 1_048_576.0)
-    }
-    /// True when the builder stamped any build provenance. Packages without
-    /// compilation evidence (os-release and friends) stay unstamped and the
-    /// page renders nothing rather than an inference.
-    pub fn has_build_info(&self) -> bool {
-        self.meta.as_ref().is_some_and(|m| {
-            !(m.build_compiler.is_empty()
-                && m.build_cflags.is_empty()
-                && m.build_cxxflags.is_empty()
-                && m.build_ldflags.is_empty()
-                && m.build_rustflags.is_empty()
-                && m.build_producers.is_empty()
-                && m.build_flag_passthrough.is_empty())
-        })
-    }
-    /// Producer stamp, artifact-verified first: "clang 22.1.8 · lld 22.1.8"
-    /// straight from [[build_producers]] when the manifest carries them;
-    /// falls back to the legacy injected-compiler pair ("clang: 22.1.8,
-    /// gcc: 15.3.0" renders as "clang 22.1.8 · gcc 15.3.0"). Empty when the
-    /// build recorded neither.
-    pub fn compiler_line(&self) -> String {
-        let Some(m) = &self.meta else {
-            return String::new();
-        };
-        if !m.build_producers.is_empty() {
-            return m
-                .build_producers
-                .iter()
-                .map(|p| {
-                    let v = p.versions.first().map(String::as_str).unwrap_or("?");
-                    format!("{} {v}", p.name)
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
-        }
-        if m.build_compiler.is_empty() {
-            return String::new();
-        }
-        if m.build_compiler_version.is_empty() {
-            return m.build_compiler.clone();
-        }
-        if m.build_compiler_version.contains(": ") {
-            m.build_compiler_version
-                .split(", ")
-                .map(|pair| pair.replace(": ", " "))
-                .collect::<Vec<_>>()
-                .join(" · ")
-        } else {
-            format!("{} {}", m.build_compiler, m.build_compiler_version)
-        }
-    }
-    /// The stamped flag lines, in display order; empty when none recorded.
-    pub fn flag_lines(&self) -> Vec<FlagLine> {
-        let Some(m) = &self.meta else {
-            return Vec::new();
-        };
-        [
-            ("CFLAGS", &m.build_cflags),
-            ("CXXFLAGS", &m.build_cxxflags),
-            ("LDFLAGS", &m.build_ldflags),
-            ("RUSTFLAGS", &m.build_rustflags),
-        ]
-        .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(label, value)| FlagLine {
-            label: label.to_string(),
-            value: value.clone(),
-        })
-        .collect()
-    }
-    /// Per-producer switches verified from DWARF (one line per producer
-    /// that carries flags); empty when no producer recorded switches.
-    pub fn producer_flag_lines(&self) -> Vec<FlagLine> {
-        let Some(m) = &self.meta else {
-            return Vec::new();
-        };
-        let mut out: Vec<FlagLine> = Vec::new();
-        for p in &m.build_producers {
-            if p.flags.is_empty() || p.name.is_empty() {
-                continue;
-            }
-            out.push(FlagLine {
-                label: if p.versions.is_empty() {
-                    p.name.clone()
-                } else {
-                    format!("{} {}", p.name, p.versions[0])
-                },
-                value: p.flags.clone(),
-            });
-        }
-        out
-    }
-    /// Env channels the recipe forwarded flags through ("KCFLAGS"); empty
-    /// when none annotated.
-    pub fn passthrough_channels(&self) -> &[String] {
-        self.meta
-            .as_ref()
-            .map(|m| m.build_flag_passthrough.as_slice())
-            .unwrap_or(&[])
     }
     /// True when the manifest ships a universal service definition.
     pub fn is_daemon(&self) -> bool {
@@ -860,9 +794,7 @@ fn json_err(e: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
-fn map_package_row(
-    r: &rusqlite::Row<'_>,
-) -> std::result::Result<PackageRow, rusqlite::Error> {
+fn map_package_row(r: &rusqlite::Row<'_>) -> std::result::Result<PackageRow, rusqlite::Error> {
     Ok(PackageRow {
         name: r.get(0)?,
         arch: r.get(1)?,
@@ -879,6 +811,40 @@ fn map_package_row(
         conffiles: serde_json::from_str(&r.get::<_, String>(12)?).map_err(json_err)?,
         source_url: r.get(13)?,
         source_sha256: r.get(14)?,
-        recipe_path: r.get(15)?,
+        upstream_url: r.get(15)?,
+        upstream_version_regex: r.get(16)?,
+        recipe_path: r.get(17)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_metadata_survives_recipe_cache_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let recipe = Recipe::from_toml(
+            "schema_version = 2\n\
+             [package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"1\"\n\
+             [upstream]\nurl = \"https://zlib.net/\"\nversion_regex = 'zlib-(\\d+\\.\\d+\\.\\d+)'\n",
+        )
+        .unwrap();
+        rebuild_packages(
+            &conn,
+            &[RecipeRecord {
+                recipe,
+                arch: "amd64".into(),
+                origin: "https://github.com/sclinuxdev/recipes.amd64".into(),
+                category: "libs".into(),
+                recipe_path: "libs/zlib/1.3.2-1/recipe.toml".into(),
+                git_commit: "deadbeef".into(),
+            }],
+        )
+        .unwrap();
+        let row = package_by_name(&conn, "zlib").unwrap().unwrap();
+        assert_eq!(row.upstream_url, "https://zlib.net/");
+        assert_eq!(row.upstream_version_regex, r"zlib-(\d+\.\d+\.\d+)");
+    }
 }
