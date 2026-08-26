@@ -137,9 +137,9 @@ impl Recipe {
             conffiles.extend(table_strings(scope, "conffiles"));
         }
 
-        // Recipe v2 may identify the packages providing its default compiler
-        // and linker suite. Expose those as build dependencies just as Sage's
-        // parser does; executable selection remains Sage policy, not metadata.
+        // Recipe v2 may independently constrain any tool package. Expose each
+        // declared requirement as a build dependency just as Sage's parser
+        // does; executable selection remains Sage policy, not metadata.
         if let Some(toolchain) = doc
             .get("build")
             .and_then(|v| v.as_table())
@@ -148,10 +148,7 @@ impl Recipe {
         {
             for kind in ["compiler", "linker", "rust"] {
                 let Some(tool) = toolchain.get(kind).and_then(|v| v.as_table()) else {
-                    if kind == "rust" {
-                        continue;
-                    }
-                    anyhow::bail!("build.toolchain requires a {kind} table");
+                    continue;
                 };
                 let family = table_str(tool, "family")
                     .with_context(|| format!("build.toolchain.{kind} has no family"))?;
@@ -320,8 +317,6 @@ mod tests {
             "schema_version = 2\n\
              [package]\nname = \"cargo-example\"\nversion = \"1\"\n\
              [build]\nsystem = \"cargo\"\n\
-             [build.toolchain.compiler]\nfamily = \"clang\"\npackage = \"clang\"\nminimum_version = \"22\"\n\
-             [build.toolchain.linker]\nfamily = \"lld\"\npackage = \"lld\"\nminimum_version = \"22\"\n\
              [build.toolchain.rust]\nfamily = \"rustc\"\npackage = \"rust\"\nminimum_version = \"1.90\"\n",
         )
         .unwrap();
