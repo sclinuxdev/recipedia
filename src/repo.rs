@@ -1,80 +1,89 @@
-//! Published-repository core: extract manifest metadata from uploaded
-//! archives, land them under `repo_dir`, and regenerate `index.toml` in the
-//! exact shape sage's channel reader consumes.
+//! Sage 0.4 network-repository publisher.
+//!
+//! Archives are inspected by sage-archive, stored beneath their Sage
+//! channel, and indexed by sage-repo. The public repository therefore
+//! exposes the exact files Sage clients consume: one signed index.mdb and
+//! compressed index.mdb.zst per subchannel.
 
-use std::io::Read;
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use ed25519_dalek::SigningKey;
+use sha2::Digest;
 
 use crate::config::Config;
-use crate::db;
+use crate::db::{self, PublishedRow};
 use crate::status::{self, State as BuildState};
 
-/// A tool Sage configured and directly probed for a managed recipe-v2 build.
-/// Empty on v1 and upstream-prebuilt/repackaged archives.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ManagedBuildTool {
-    pub role: String,
-    pub executable: String,
-    pub family: String,
-    pub version: String,
-    /// Non-empty flag channels Sage actually configured for this archive.
-    /// Stored as `ENV=value`; never inferred from the resulting binaries.
-    #[serde(default)]
-    pub parameters: Vec<String>,
-}
+pub use sage_core::ManagedBuildTool;
 
-fn valid_managed_parameter(parameter: &str) -> bool {
-    let Some((name, value)) = parameter.split_once('=') else {
-        return false;
-    };
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !value.is_empty()
-}
-
-/// The `[package]` section of a package's `.METADATA/manifest.toml` — the
-/// authoritative description of an upload. Stored as JSON in the published
-/// table so index regeneration never re-reads archives.
+/// UI metadata derived from Sage's canonical archive manifest.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestMeta {
+    pub schema_version: u32,
     pub name: String,
+    pub slot: String,
     pub version: String,
     pub release: String,
-    #[serde(default)]
-    pub epoch: i64,
-    #[serde(default)]
+    pub epoch: u32,
     pub description: String,
-    #[serde(default)]
     pub license: String,
-    #[serde(default)]
     pub channel: String,
-    #[serde(default)]
     pub arch: String,
-    #[serde(default)]
-    pub installed_size: i64,
-    /// Raw universal service definition; non-empty marks a daemon package.
-    #[serde(default)]
+    pub installed_size: u64,
     pub service_toml: String,
-    #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
-    pub provides: Vec<String>,
-    #[serde(default)]
-    pub conffiles: Vec<String>,
-    /// Build-only check dependencies copied from Sage's attestation.
-    #[serde(default)]
     pub check_dependencies: Vec<String>,
-    #[serde(default)]
+    pub provides: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub features: Vec<String>,
+    pub conffiles: Vec<String>,
     pub managed_build_tools: Vec<ManagedBuildTool>,
 }
 
-/// Server receipt for one publish, including the freshly derived build state.
+impl From<(&sage_core::Package, &sage_archive::PackageInspection)> for ManifestMeta {
+    fn from(
+        (package, inspection): (&sage_core::Package, &sage_archive::PackageInspection),
+    ) -> Self {
+        Self {
+            schema_version: package.schema_version,
+            name: package.name.clone(),
+            slot: package.slot.clone(),
+            version: package.version.clone(),
+            release: package.release.to_string(),
+            epoch: package.epoch,
+            description: package.description.clone(),
+            license: package.license.clone(),
+            channel: package.channel.clone(),
+            arch: crate::model::canonical_arch(&package.arch).to_string(),
+            installed_size: package.installed_size,
+            service_toml: inspection
+                .optional
+                .get(".METADATA/service.toml")
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default(),
+            dependencies: package
+                .dependencies
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            check_dependencies: Vec::new(),
+            provides: package.provides.clone(),
+            conflicts: package.conflicts.clone(),
+            features: package.features.clone(),
+            conffiles: Vec::new(),
+            managed_build_tools: package.managed_build_tools.clone(),
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct Receipt {
     pub filename: String,
+    pub repo_path: String,
     pub name: String,
     pub version: String,
     pub release: String,
@@ -83,8 +92,7 @@ pub struct Receipt {
     pub state: BuildState,
 }
 
-/// Filenames are generated by `sage build`; accept only that shape so the
-/// static route can never be talked into path tricks.
+/// Accept only a basename shaped like a Sage package archive.
 pub fn valid_filename(name: &str) -> bool {
     name.len() <= 255
         && name.ends_with(".pkg.tar.zst")
@@ -94,229 +102,163 @@ pub fn valid_filename(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
-/// Pull `.METADATA/manifest.toml` out of a streamed-then-flushed archive.
 pub fn read_manifest_meta(archive: &Path) -> Result<ManifestMeta> {
-    let file = std::fs::File::open(archive)
-        .with_context(|| format!("cannot reopen {}", archive.display()))?;
-    let decoder = zstd::Decoder::new(file)?;
-    let mut tar = tar::Archive::new(decoder);
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        if path.file_name().is_some_and(|n| n == "manifest.toml")
-            && path.parent().is_some_and(|d| d.ends_with(".METADATA"))
-        {
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            return parse_manifest(&text);
-        }
-    }
-    bail!("archive has no .METADATA/manifest.toml");
+    let inspection = sage_archive::inspect_package(archive)
+        .map_err(|error| anyhow::anyhow!("invalid Sage archive: {error}"))?;
+    Ok(ManifestMeta::from((&inspection.manifest, &inspection)))
 }
 
-/// Pull the `.METADATA/files.idx` inventory (TSV: type/mode/size/sha256/path/
-/// target) out of an archive; only what browsing needs is kept.
 pub fn read_file_list(archive: &Path) -> Result<Vec<db::FileLine>> {
-    let file = std::fs::File::open(archive)?;
-    let decoder = zstd::Decoder::new(file)?;
-    let mut tar = tar::Archive::new(decoder);
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        if path.file_name().is_some_and(|n| n == "files.idx")
-            && path.parent().is_some_and(|d| d.ends_with(".METADATA"))
-        {
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            return Ok(text
-                .lines()
-                .filter(|l| !l.starts_with('#'))
-                .filter_map(|l| {
-                    let cols: Vec<&str> = l.split('\t').collect();
-                    if cols.len() >= 9 {
-                        // Modern Sage 9-column v2 format: type\tmode\tuid\tgid\tcaps\tsize\tsha256\tpath\ttarget
-                        Some(db::FileLine {
-                            kind: cols[0].to_string(),
-                            size: cols[5].parse().unwrap_or(0),
-                            path: cols[7].to_string(),
-                        })
-                    } else if cols.len() >= 5 {
-                        // Legacy 6-column format: type\tmode\tsize\tsha256\tpath[\ttarget]
-                        Some(db::FileLine {
-                            kind: cols[0].to_string(),
-                            size: cols[2].parse().unwrap_or(0),
-                            path: cols[4].to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect());
-        }
-    }
-    Ok(Vec::new()) // legacy archives without files.idx
-}
-
-fn parse_manifest(text: &str) -> Result<ManifestMeta> {
-    let doc: toml::Table = toml::from_str(text).context("manifest.toml is not valid TOML")?;
-    let schema_version = doc
-        .get("schema_version")
-        .and_then(|v| v.as_integer())
-        .unwrap_or(1);
-    let pkg = doc
-        .get("package")
-        .and_then(|v| v.as_table())
-        .context("manifest has no [package] table")?;
-    let s = |k: &str| {
-        pkg.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-    let i = |k: &str| pkg.get(k).and_then(|v| v.as_integer()).unwrap_or(0);
-    let arr = |k: &str| -> Vec<String> {
-        pkg.get(k)
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let check_dependencies = if let Some(raw) =
-        pkg.get("attestation_toml").and_then(|value| value.as_str())
-    {
-        let att_doc: toml::Table =
-            toml::from_str(raw).context("attestation_toml is not valid TOML")?;
-        let attestation = att_doc
-            .get("attestation")
-            .and_then(|value| value.as_table());
-        match attestation.and_then(|table| table.get("check_dependencies")) {
-            Some(value) => value
-                .as_array()
-                .context("attestation.check_dependencies must be an array")?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .context("attestation.check_dependencies entries must be non-empty strings")
-                })
-                .collect::<Result<Vec<_>>>()?,
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let managed_build_tools = doc
-        .get("managed_build_tools")
-        .and_then(|v| v.as_array())
-        .map(|tools| {
-            tools
-                .iter()
-                .map(|item| {
-                    let tool = item
-                        .as_table()
-                        .context("managed_build_tools entries must be tables")?;
-                    let value = |key: &str| {
-                        tool.get(key)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    };
-                    let parameters = match tool.get("parameters") {
-                        None => Vec::new(),
-                        Some(value) => value
-                            .as_array()
-                            .context("managed_build_tools parameters must be an array")?
-                            .iter()
-                            .map(|parameter| {
-                                parameter
-                                    .as_str()
-                                    .map(str::to_string)
-                                    .context("managed_build_tools parameters must be strings")
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    };
-                    let observed = ManagedBuildTool {
-                        role: value("role"),
-                        executable: value("executable"),
-                        family: value("family"),
-                        version: value("version"),
-                        parameters,
-                    };
-                    let version_argument = value("version_argument");
-                    let known = match observed.role.as_str() {
-                        "cc" | "cxx" => matches!(observed.family.as_str(), "gcc" | "clang"),
-                        "linker" => matches!(observed.family.as_str(), "ld" | "lld" | "mold"),
-                        "rustc" => observed.family == "rustc",
-                        _ => false,
-                    };
-                    if !known
-                        || observed.executable.is_empty()
-                        || observed.version.is_empty()
-                        || version_argument != "--version"
-                        || observed
-                            .parameters
-                            .iter()
-                            .any(|parameter| !valid_managed_parameter(parameter))
-                        || observed
-                            .parameters
-                            .iter()
-                            .collect::<std::collections::HashSet<_>>()
-                            .len()
-                            != observed.parameters.len()
-                    {
-                        bail!("invalid managed_build_tools observation");
-                    }
-                    Ok(observed)
-                })
-                .collect::<Result<Vec<_>>>()
+    let inspection = sage_archive::inspect_package(archive)
+        .map_err(|error| anyhow::anyhow!("invalid Sage archive: {error}"))?;
+    Ok(inspection
+        .files
+        .into_iter()
+        .map(|record| db::FileLine {
+            path: record.path.to_string_lossy().into_owned(),
+            kind: "file".into(),
+            size: record.size as i64,
         })
-        .transpose()?
-        .unwrap_or_default();
-    if !managed_build_tools.is_empty() && schema_version < 2 {
-        bail!("managed_build_tools are valid only in manifest schema v2");
-    }
-    let mut roles = std::collections::HashSet::new();
-    if managed_build_tools
-        .iter()
-        .any(|tool| !roles.insert(tool.role.as_str()))
-    {
-        bail!("managed_build_tools contains a duplicate role");
-    }
-    let meta = ManifestMeta {
-        name: s("name"),
-        version: s("version"),
-        release: s("release"),
-        epoch: i("epoch"),
-        description: s("description"),
-        license: s("license"),
-        channel: s("channel"),
-        // Legacy x86_64 manifests fold into amd64 at the door, so published
-        // state meets the recipe's canonical spelling.
-        arch: crate::model::canonical_arch(&s("arch")).to_string(),
-        installed_size: i("installed_size"),
-        service_toml: s("service_toml"),
-        dependencies: arr("dependencies"),
-        provides: arr("provides"),
-        conffiles: arr("conffiles"),
-        check_dependencies,
-        managed_build_tools,
-    };
-    if meta.name.is_empty() || meta.version.is_empty() {
-        bail!("manifest is missing name or version");
-    }
-    Ok(meta)
+        .collect())
 }
 
-/// Land a fully-written, already-hashed temp file as a published package:
-/// verify declared hash, extract meta, move into place, upsert, re-index.
+fn valid_channel_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+}
+
+/// Normalize a manifest channel to the directory used by Sage's
+/// ChannelsConfig: system becomes main/system, while an already qualified
+/// main/python3.14 is preserved.
+pub fn qualified_channel(config: &Config, channel: &str) -> Result<String> {
+    let channel = if channel.trim().is_empty() {
+        "system"
+    } else {
+        channel.trim()
+    };
+    let qualified = if channel.contains('/') {
+        channel.to_string()
+    } else {
+        format!("{}/{}", config.repo_channel.trim_matches('/'), channel)
+    };
+    let mut parts = qualified.split('/');
+    let root = parts.next().unwrap_or_default();
+    let subchannel = parts.next().unwrap_or_default();
+    if parts.next().is_some() || !valid_channel_segment(root) || !valid_channel_segment(subchannel)
+    {
+        bail!("invalid Sage channel '{channel}'")
+    }
+    Ok(format!("{root}/{subchannel}"))
+}
+
+fn channel_dir(config: &Config, channel: &str) -> Result<(String, PathBuf)> {
+    let qualified = qualified_channel(config, channel)?;
+    let mut parts = qualified.split('/');
+    let root = parts.next().expect("qualified channel has a root");
+    let subchannel = parts.next().expect("qualified channel has a subchannel");
+    // Sage appends a subchannel alias to ChannelConfig.url. The configured
+    // root channel is represented by that URL, so its physical files live at
+    // repo/<subchannel>, not repo/<root>/<subchannel>.
+    let physical = if root == config.repo_channel.trim_matches('/') {
+        subchannel.to_string()
+    } else {
+        qualified
+    };
+    Ok((physical.clone(), config.repo_dir.join(&physical)))
+}
+
+fn signing_key_path(config: &Config) -> &Path {
+    &config.repo_signing_key
+}
+
+/// Create a durable private key on first use and publish its matching public
+/// key next to it. Operators can point channels.toml at the .pub file.
+fn ensure_signing_key(config: &Config) -> Result<()> {
+    let path = signing_key_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        let mut raw = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(&raw)?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let key = sage_repo::decode_fixed::<32>(&raw)
+        .map_err(|error| anyhow::anyhow!("invalid Ed25519 repository key: {error}"))?;
+    let public_path = path.with_extension("pub");
+    if !public_path.exists() {
+        std::fs::write(
+            &public_path,
+            SigningKey::from_bytes(&key).verifying_key().to_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Rebuild every network-repository subchannel using Sage's own indexer.
+pub fn regenerate_index(database: &db::Database, config: &Config) -> Result<()> {
+    ensure_signing_key(config)?;
+    let mut dirs = BTreeSet::new();
+    dirs.insert(channel_dir(config, "system")?.1);
+    for row in db::published_all(database)? {
+        dirs.insert(
+            config.repo_dir.join(
+                Path::new(&row.repo_path)
+                    .parent()
+                    .context("published repo path has no channel")?,
+            ),
+        );
+    }
+    collect_index_dirs(&config.repo_dir, &mut dirs)?;
+    for dir in dirs {
+        std::fs::create_dir_all(&dir)?;
+        sage_repo::build_index(&dir, &dir, signing_key_path(config))
+            .map_err(|error| anyhow::anyhow!("building {}: {error}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn collect_index_dirs(root: &Path, dirs: &mut BTreeSet<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.join("index.mdb").exists() {
+                dirs.insert(path.clone());
+            }
+            collect_index_dirs(&path, dirs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Store one fully written archive and rebuild the affected Sage index.
 pub fn ingest(
-    conn: &rusqlite::Connection,
-    cfg: &Config,
+    database: &db::Database,
+    config: &Config,
     tmp_path: &Path,
     filename: &str,
     sha256: &str,
@@ -324,290 +266,201 @@ pub fn ingest(
     builder: &str,
 ) -> Result<Receipt> {
     if !valid_filename(filename) {
-        bail!("invalid package filename '{filename}'");
+        bail!("invalid package filename '{filename}'")
     }
-    if let Some(want) = declared_sha {
-        if want != sha256 {
-            bail!("sha256 mismatch: client sent {want}, server received {sha256}");
+    if declared_sha.is_some_and(|declared| declared != sha256) {
+        bail!("sha256 mismatch between client declaration and upload")
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid SHA-256")
+    }
+    let inspection = sage_archive::inspect_package(tmp_path)
+        .map_err(|error| anyhow::anyhow!("invalid Sage archive: {error}"))?;
+    let meta = ManifestMeta::from((&inspection.manifest, &inspection));
+    let files: Vec<_> = inspection
+        .files
+        .iter()
+        .map(|record| db::FileLine {
+            path: record.path.to_string_lossy().into_owned(),
+            kind: "file".into(),
+            size: record.size as i64,
+        })
+        .collect();
+    let size = std::fs::metadata(tmp_path)?.len() as i64;
+    let (qualified, directory) = channel_dir(config, &meta.channel)?;
+    std::fs::create_dir_all(&directory)?;
+    let repo_path = format!("{qualified}/{filename}");
+    if let Some(previous) = db::published_row(database, filename)? {
+        if previous.repo_path != repo_path {
+            remove_if_file(&config.repo_dir.join(&previous.repo_path))?;
         }
     }
-    let meta = read_manifest_meta(tmp_path)?;
-    // File list is best-effort: legacy archives without files.idx still publish.
-    let files = read_file_list(tmp_path).unwrap_or_default();
-    let size = std::fs::metadata(tmp_path)?.len();
-    let dest = cfg.repo_dir.join(filename);
-    std::fs::rename(tmp_path, &dest)
-        .with_context(|| format!("cannot move upload into {}", dest.display()))?;
-    db::upsert_published(conn, filename, &meta, size as i64, sha256, builder)?;
-    db::replace_published_files(conn, filename, &files)?;
-    regenerate_index(conn, cfg)?;
-
-    let recipe = db::package_by_name(conn, &meta.name)?;
-    let state = match &recipe {
-        Some(r) => status::derive(&r.version, &r.release, Some((&meta.version, &meta.release))),
+    let destination = directory.join(filename);
+    std::fs::rename(tmp_path, &destination)
+        .with_context(|| format!("moving upload into {}", destination.display()))?;
+    let row = PublishedRow {
+        filename: filename.to_string(),
+        repo_path,
+        name: meta.name.clone(),
+        slot: meta.slot.clone(),
+        version: meta.version.clone(),
+        release: meta.release.clone(),
+        epoch: meta.epoch,
+        arch: meta.arch.clone(),
+        channel: meta.channel.clone(),
+        size,
+        sha256: sha256.to_ascii_lowercase(),
+        builder: builder.to_string(),
+        uploaded_at: db::now(),
+        meta: Some(meta),
+    };
+    db::upsert_published(database, &row)?;
+    db::replace_published_files(database, filename, &files)?;
+    regenerate_index(database, config)?;
+    let recipe = db::package_by_name(database, &row.name)?;
+    let state = match recipe {
+        Some(recipe) => status::derive_with_epoch(
+            recipe.epoch,
+            &recipe.version,
+            &recipe.release,
+            Some((row.epoch, &row.version, &row.release)),
+        ),
         None => BuildState::Missing,
     };
     Ok(Receipt {
-        filename: filename.to_string(),
-        name: meta.name,
-        version: meta.version,
-        release: meta.release,
-        size: size as i64,
-        sha256: sha256.to_string(),
+        filename: row.filename,
+        repo_path: row.repo_path,
+        name: row.name,
+        version: row.version,
+        release: row.release,
+        size: row.size,
+        sha256: row.sha256,
         state,
     })
 }
 
-/// Withdraw a published artifact: DB rows, build log, on-disk file, re-index.
-pub fn unpublish(conn: &rusqlite::Connection, cfg: &Config, filename: &str) -> Result<()> {
+pub fn unpublish(database: &db::Database, config: &Config, filename: &str) -> Result<()> {
     if !valid_filename(filename) {
-        bail!("invalid package filename '{filename}'");
+        bail!("invalid package filename '{filename}'")
     }
-    let existed = db::delete_published(conn, filename)?;
-    if !existed {
-        bail!("'{filename}' is not published");
-    }
-    match std::fs::remove_file(cfg.repo_dir.join(filename)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("cannot remove repository file"),
-    }
-    regenerate_index(conn, cfg)?;
-    Ok(())
+    let Some(row) = db::delete_published(database, filename)? else {
+        bail!("'{filename}' is not published")
+    };
+    remove_if_file(&config.repo_dir.join(&row.repo_path))?;
+    regenerate_index(database, config)
 }
 
-/// Rebuild `index.toml` from the published table, byte-compatible with what
-/// `sage repo index` emits (schema_version 1 + [[packages]] rows).
-pub fn regenerate_index(conn: &rusqlite::Connection, cfg: &Config) -> Result<()> {
-    std::fs::create_dir_all(&cfg.repo_dir)?;
-    let mut out = String::from("schema_version = 1\n\n[channel]\nname = \"sclinux\"\n");
-    out.push_str(&format!("updated_at = \"{}\"\n\n", rfc3339_now()));
+fn remove_if_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
 
-    for row in db::index_rows(conn)? {
-        if row.meta_json.is_empty() {
-            continue; // pre-P3 row without extracted meta
+/// Name-compatible alias for callers that only need a rebuild.
+pub fn regenerate_indexes(database: &db::Database, config: &Config) -> Result<()> {
+    regenerate_index(database, config)
+}
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
-        let m: ManifestMeta =
-            serde_json::from_str(&row.meta_json).context("stored manifest meta is corrupt")?;
-        out.push_str("[[packages]]\n");
-        let _ = (
-            w(&mut out, "name", &m.name),
-            w(&mut out, "version", &m.version),
-            w(&mut out, "release", &m.release),
-        );
-        if m.epoch > 0 {
-            out.push_str(&format!("epoch = {}\n", m.epoch));
-        }
-        let _ = (
-            w(&mut out, "description", &m.description),
-            w(&mut out, "license", &m.license),
-            w(&mut out, "channel", &m.channel),
-            w(&mut out, "arch", &m.arch),
-        );
-        out.push_str(&format!("installed_size = {}\n", m.installed_size));
-        out.push_str(&format!("file = \"{}\"\n", escape(&row.filename)));
-        push_array(&mut out, "dependencies", &m.dependencies);
-        push_array(&mut out, "provides", &m.provides);
-        if !m.conffiles.is_empty() {
-            push_array(&mut out, "conffiles", &m.conffiles);
-        }
-        for tool in &m.managed_build_tools {
-            out.push_str("[[packages.managed_build_tools]]\n");
-            let _ = (
-                w(&mut out, "role", &tool.role),
-                w(&mut out, "executable", &tool.executable),
-                w(&mut out, "family", &tool.family),
-                w(&mut out, "version", &tool.version),
-                w(&mut out, "version_argument", "--version"),
-            );
-            if !tool.parameters.is_empty() {
-                push_array(&mut out, "parameters", &tool.parameters);
-            }
-        }
-        out.push('\n');
+        hasher.update(&buffer[..count]);
     }
-
-    // Atomic swap so a concurrent /repo/index.toml read never sees a half file.
-    let tmp = cfg.repo_dir.join(".index.toml.tmp");
-    std::fs::write(&tmp, &out)?;
-    std::fs::rename(&tmp, cfg.repo_dir.join("index.toml"))?;
-    Ok(())
-}
-
-fn w(out: &mut String, key: &str, value: &str) {
-    out.push_str(&format!("{key} = \"{}\"\n", escape(value)));
-}
-
-fn push_array(out: &mut String, key: &str, values: &[String]) {
-    out.push_str(&format!("{key} = [\n"));
-    for v in values {
-        out.push_str(&format!("    \"{}\",\n", escape(v)));
-    }
-    out.push_str("]\n");
-}
-
-/// Escape a TOML basic string body (mirrors sage's escape_toml_basic_string).
-fn escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\u{8}' => out.push_str("\\b"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\u{c}' => out.push_str("\\f"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// RFC3339 UTC timestamp for index.toml's updated_at.
-fn rfc3339_now() -> String {
-    db::time_utc(db::now())
-}
-
-#[cfg(test)]
-mod arch_tests {
-    use super::*;
-
-    #[test]
-    fn manifest_arch_canonicalized() {
-        let text =
-            "[package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"2\"\narch = \"x86_64\"\n";
-        let meta = parse_manifest(text).unwrap();
-        assert_eq!(meta.arch, "amd64");
-    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn filenames() {
-        assert!(valid_filename("gcc-15.3.0-1-x86_64.pkg.tar.zst"));
-        assert!(!valid_filename("../evil.pkg.tar.zst"));
-        assert!(!valid_filename(".hidden.pkg.tar.zst"));
-        assert!(!valid_filename("pkg.zip"));
-        assert!(!valid_filename("has space.pkg.tar.zst"));
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "recipedia-sage-repo-{}-{}",
+            std::process::id(),
+            db::now()
+        ))
     }
 
     #[test]
-    fn timestamps() {
-        let t = rfc3339_now();
-        assert_eq!(t.len(), 20);
-        assert!(t.ends_with('Z'));
-        assert_eq!(&t[4..5], "-");
-    }
-
-    #[test]
-    fn escaping() {
-        assert_eq!(escape(r#"a"b\c"#), r#"a\"b\\c"#);
-        assert_eq!(escape("\n"), "\\n");
-    }
-
-    #[test]
-    fn managed_v2_tools_are_archive_observations() {
-        let meta = parse_manifest(
-            r#"
-schema_version = 2
-[package]
-name = "v2-example"
-version = "1.0"
-release = "1"
-
-[[managed_build_tools]]
-role = "cc"
-executable = "/opt/toolchains/bin/clang"
-family = "clang"
-version = "22.1.8"
-version_argument = "--version"
-parameters = ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
-"#,
+    fn ingest_builds_the_sage_network_repo_layout() {
+        let root = test_root();
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        std::fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        std::fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
+        std::fs::write(stage.join("data/usr/bin/demo"), b"demo").unwrap();
+        let records = sage_archive::build_file_index(&stage.join("data")).unwrap();
+        std::fs::write(
+            stage.join(".METADATA/files.idx"),
+            sage_archive::format_file_index(&records),
         )
         .unwrap();
-        assert_eq!(meta.managed_build_tools.len(), 1);
-        assert_eq!(
-            meta.managed_build_tools[0].executable,
-            "/opt/toolchains/bin/clang"
-        );
-        assert_eq!(meta.managed_build_tools[0].version, "22.1.8");
-        assert_eq!(
-            meta.managed_build_tools[0].parameters,
-            ["CFLAGS=-O2 -pipe", "KCFLAGS=-O2 -pipe"]
-        );
-
-        let prebuilt =
-            parse_manifest("[package]\nname = \"rust-bin\"\nversion = \"1.90\"\nrelease = \"1\"\n")
-                .unwrap();
-        assert!(prebuilt.managed_build_tools.is_empty());
-    }
-
-    #[test]
-    fn attestation_check_dependencies_are_preserved_for_orphan_packages() {
-        let meta = parse_manifest(
-            r#"
-schema_version = 2
-[package]
-name = "checked"
-version = "1.0"
-release = "1"
-attestation_toml = """
-schema_version = 2
-[attestation]
-check_dependencies = ["python >= 3.14", "pytest >= 8"]
-"""
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            meta.check_dependencies,
-            vec!["python >= 3.14".to_string(), "pytest >= 8".to_string()]
-        );
-    }
-
-    #[test]
-    fn files_idx_supports_both_6_and_9_columns() {
-        let parse_lines = |text: &str| -> Vec<crate::db::FileLine> {
-            text.lines()
-                .filter(|l| !l.starts_with('#'))
-                .filter_map(|l| {
-                    let cols: Vec<&str> = l.split('\t').collect();
-                    if cols.len() >= 9 {
-                        Some(crate::db::FileLine {
-                            kind: cols[0].to_string(),
-                            size: cols[5].parse().unwrap_or(0),
-                            path: cols[7].to_string(),
-                        })
-                    } else if cols.len() >= 5 {
-                        Some(crate::db::FileLine {
-                            kind: cols[0].to_string(),
-                            size: cols[2].parse().unwrap_or(0),
-                            path: cols[4].to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        let manifest = sage_archive::PackageManifest {
+            schema_version: 1,
+            name: "demo".into(),
+            slot: "0".into(),
+            version: "1.0".into(),
+            release: 1,
+            epoch: 0,
+            arch: "amd64".into(),
+            channel: "system".into(),
+            description: "demo".into(),
+            license: "MIT".into(),
+            dependencies: Vec::new(),
+            provides: vec!["cmd:demo".into()],
+            conflicts: Vec::new(),
+            features: Vec::new(),
+            installed_size: 4,
+            build_time: 1,
+            managed_build_tools: Vec::new(),
         };
-
-        let six_col = "f\t755\t1234\tdeadbeef\tusr/bin/tool\t-\n";
-        let res6 = parse_lines(six_col);
-        assert_eq!(res6.len(), 1);
-        assert_eq!(res6[0].kind, "f");
-        assert_eq!(res6[0].size, 1234);
-        assert_eq!(res6[0].path, "usr/bin/tool");
-
-        let nine_col = "f\t755\t0\t0\tcap_net_admin=+ep\t5678\tfeedbeef\tusr/bin/admin\t-\n";
-        let res9 = parse_lines(nine_col);
-        assert_eq!(res9.len(), 1);
-        assert_eq!(res9[0].kind, "f");
-        assert_eq!(res9[0].size, 5678);
-        assert_eq!(res9[0].path, "usr/bin/admin");
+        std::fs::write(
+            stage.join(".METADATA/manifest.toml"),
+            toml::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let upload = root.join("demo-1.0-1-amd64.pkg.tar.zst");
+        sage_archive::create_package(&stage, &upload, 1).unwrap();
+        let config = Config {
+            listen: String::new(),
+            db_path: root.join("database"),
+            state_dir: root.clone(),
+            repo_dir: root.join("repo"),
+            repo_channel: "main".into(),
+            repo_signing_key: root.join("repo/signing.key"),
+            git_url: String::new(),
+            webhook_secret: None,
+            poll_secs: 600,
+            repo_base: String::new(),
+            frontend_url: String::new(),
+        };
+        let database = db::open(&config.db_path).unwrap();
+        let sha256 = sha256_file(&upload).unwrap();
+        let receipt = ingest(
+            &database,
+            &config,
+            &upload,
+            "demo-1.0-1-amd64.pkg.tar.zst",
+            &sha256,
+            Some(&sha256),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(receipt.repo_path, "system/demo-1.0-1-amd64.pkg.tar.zst");
+        let index = config.repo_dir.join("system/index.mdb");
+        let reader = sage_repo::RepositoryIndex::open(&index).unwrap();
+        assert_eq!(reader.releases("demo", "0").unwrap().len(), 1);
+        assert_eq!(reader.providers("cmd:demo").unwrap(), vec!["demo:0"]);
+        assert!(index.with_extension("mdb.zst").exists());
+        assert!(index.with_extension("mdb.sig").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

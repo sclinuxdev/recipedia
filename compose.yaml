@@ -3,7 +3,7 @@
 #   docker build --pull --build-arg RECIPEEDIA_VERSION=0.1.5 \
 #     -t recipedia:0.1.5 -t recipedia:latest \
 #     https://github.com/sclinuxdev/recipedia.git#v0.1.5
-# 状态(SQLite + git 镜像 + 已发布包)全部落在数据卷里; 建议在编排的 .env 中设
+# 状态(LMDB + git 镜像 + Sage 网络仓库)全部落在数据卷里; 建议在编排的 .env 中设
 # RECIPEEDIA_DATA_DIR=/srv/recipedia 把它钉在固定绝对路径, 删编排/换位置都不丢。
 services:
   recipedia:
@@ -26,10 +26,14 @@ services:
       # repo 文件浏览域的域根(不带 /repo 路径): 导航 Repo 与下载链接指向它;
       # 反代把该域的 / 转发到应用的 /repo/(见下)。不填则走同域 /repo/
       RECIPEEDIA_REPO_URL: ${RECIPEEDIA_REPO_URL:-https://repo.qzkago.com}
+      RECIPEEDIA_REPO_CHANNEL: ${RECIPEEDIA_REPO_CHANNEL:-main}
+      # 留空则首次发布时在数据卷中生成 signing.key 和 signing.pub
+      RECIPEEDIA_REPO_SIGNING_KEY: ${RECIPEEDIA_REPO_SIGNING_KEY:-}
 
 # 1Panel 两个网站的反代配置(nginx):
 #   rp.qzkago.com   -> proxy_pass http://127.0.0.1:8300;
 #                      并加 client_max_body_size 8192m; (网页上传大包走这个域)
 #   repo.qzkago.com -> proxy_pass http://127.0.0.1:8300/repo/;
 #                      尾斜杠必须有: 它把 / 前缀映射成上游的 /repo/ 前缀,
-#                      于是 https://repo.qzkago.com/<文件名> 直出包档案。
+#                      于是 https://repo.qzkago.com/<子频道>/<文件名> 直出包档案；
+#                      Sage 客户端把 channels.main.url 指向该域名。

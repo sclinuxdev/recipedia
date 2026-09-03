@@ -12,15 +12,16 @@ built-in hosting of published binary packages.
 - **Build status** — every package's state (missing / outdated / built /
   ahead) is derived on request as the diff between recipe versions and the
   published table. Nothing is stored; the two tables are the truth.
-- **Multi-version recipes** — a package may keep several version directories;
+- **Multi-version recipes** — all matching Sage definitions are retained;
   lists and the status board show the newest, detail pages carry the ladder.
 - **Virtual names resolve** — `/package/virtual/libc` doesn't 404: it lists
   the packages whose `provides` cover the name.
 - **Package hosting** — `POST /api/repo/publish/{filename}` (bearer token)
-  streams a `*.pkg.tar.zst` straight to disk, extracts `.METADATA`, regenerates
-  an `index.toml` byte-compatible with sage's channel reader, and serves the
-  lot under `/repo/*` with sha256 ETags. Published artifacts can be withdrawn,
-  file listings are browsable, and build logs attach to their archive.
+  streams a Sage 0.4 `*.pkg.tar.zst` straight to disk, validates it with
+  Sage's archive reader, and rebuilds signed `index.mdb`, `index.mdb.zst`, and
+  `index.mdb.sig` files below `repo/<subchannel>/`. Published
+  artifacts can be withdrawn, file listings are browsable, and build logs
+  attach to their archive.
 - **`recipedia` CLI** — `login`, `publish` (ETag-aware skip, auto-attaches a
   sibling `<archive>.log`), `unpublish`, `status`.
 
@@ -41,16 +42,16 @@ Configuration is environment-only: `RECIPEEDIA_LISTEN`, `RECIPEEDIA_DB`,
 `RECIPEEDIA_STATE_DIR`, `RECIPEEDIA_GIT_URL` (one canonical repository;
 defaults to `https://github.com/sclinuxdev/recipes`), `RECIPEEDIA_WEBHOOK_SECRET`,
 `RECIPEEDIA_POLL_SECS`, `RECIPEEDIA_FRONTEND_URL` (public frontend origin),
-and `RECIPEEDIA_REPO_URL` (public repo domain for file links; unset keeps
-same-origin `/repo/...`).
+`RECIPEEDIA_REPO_URL` (public repo domain for file links; unset keeps
+same-origin `/repo/...`), `RECIPEEDIA_REPO_CHANNEL` (default `main`), and
+`RECIPEEDIA_REPO_SIGNING_KEY` (raw 32-byte Ed25519 key; generated on first
+publish when unset). The matching `.pub` file is written beside the key for
+Sage clients' `channels.toml`.
 
-The canonical tree layout is
-`<category>/<name>/<arch>/<name>-<version>-<release>/recipe.toml`. A sync diffs
-the previous and new commits and reports the architectures touched (`amd64`,
-`aarch64`, `riscv64`, `armv7`, `any`) in both the webhook response and sync
-log. Recipe-v2 validation mirrors Sage for the executable `check` phase and
-the structured/legacy patch checksum rules; check dependencies remain
-build-only metadata.
+Recipes are discovered recursively and validated with Sage 0.4's
+`RecipeSpec`; no legacy category/version-directory convention is required. A
+sync diffs the previous and new commits and reports architectures found in the
+changed paths in both the webhook response and sync log.
 
 ## Deploying (Docker / 1Panel)
 
@@ -70,7 +71,7 @@ docker exec recipedia recipedia-server token <label>
 For 1Panel, run the `docker build` command in the server terminal first, then
 open 容器 → 编排 → 创建编排 and paste `compose.yaml`. Set
 `RECIPEEDIA_DATA_DIR=/srv/recipedia` in the compose environment so removing or
-moving the compose project cannot remove SQLite, the git mirror, packages, or
+moving the compose project cannot remove the LMDB state, git mirror, packages, or
 logs. Create a reverse proxy from the public site to `127.0.0.1:8300`; if using
 the split domains shown in `compose.yaml`, proxy the repository domain to
 `http://127.0.0.1:8300/repo/` with the trailing slash. Configure the GitHub
@@ -89,8 +90,8 @@ cargo build --release
 cargo test && cargo clippy --all-targets
 ```
 
-Rust + axum + SQLite; the only state is one SQLite file, a read-only git
-mirror, and the published package directory.
+Rust + axum + LMDB; the state is one LMDB directory, a read-only git mirror,
+and the published Sage network-repository directories.
 
 ## License
 

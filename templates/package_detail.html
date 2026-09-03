@@ -42,7 +42,7 @@
     <td class="mono">{{ p.version }}-{{ p.release }}</td>
     <td><span class="badge st-built">{{ p.arch }}</span></td>
     <td class="mono muted">{{ p.builder }}</td>
-    <td class="mono"><a href="{{ nav.repo }}/{{ p.filename }}">{{ p.filename }}</a></td>
+    <td class="mono"><a href="{{ nav.repo }}/{{ p.repo_path }}">{{ p.repo_path }}</a></td>
     <td class="mono muted">{{ p.size_mib() }} MiB</td>
     <td class="mono muted"><time class="ts" datetime="{{ p.built_iso() }}">{{ p.built_at() }}</time></td>
     <td>
@@ -81,7 +81,7 @@
 
 {% if !versions.is_empty() && versions.len() > 1 %}
 <h2>Recipe versions ({{ versions.len() }})</h2>
-<p>Older recipes stay in the tree under their own version directory; the newest one is what lists and the status board show.</p>
+<p>All matching Sage package definitions stay in the catalog; the newest one is what lists and the status board show.</p>
 <table>
   <tr><th>Version</th><th>recipe.toml</th></tr>
   {% for v in versions %}

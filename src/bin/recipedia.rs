@@ -171,7 +171,7 @@ fn publish(args: Vec<String>) -> Result<()> {
             .context("bad filename")?;
         let local_sha = sha256_file(file)?;
         // Server ETag is the stored sha256; matching means it already has this exact file.
-        let head = ureq::head(format!("{}/repo/{filename}", cfg.url).as_str())
+        let head = ureq::head(format!("{}/api/repo/publish/{filename}", cfg.url).as_str())
             .set("Authorization", &format!("Bearer {}", cfg.token))
             .call();
         if let Ok(resp) = head {

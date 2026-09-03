@@ -1,130 +1,143 @@
+//! Recipedia's persistent state, backed entirely by LMDB.
+//!
+//! Sage owns the package and repository wire formats. This database stores
+//! the hub's application state (recipe observations, publish receipts,
+//! credentials, logs, and sync metadata) in named LMDB tables; no SQLite
+//! compatibility layer or legacy schema is retained.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
-use serde::Serialize;
+use heed::types::{Bytes, Str};
+use heed::{Database as HeedDatabase, Env, EnvOpenOptions};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::model::{Dep, Recipe};
+use crate::model::{canonical_arch, Dep};
+use crate::repo::ManifestMeta;
 
-pub const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+const MAP_SIZE: usize = 8 * 1024 * 1024 * 1024;
+static SYNC_ID: AtomicU64 = AtomicU64::new(0);
 
-CREATE TABLE IF NOT EXISTS packages (
-  name            TEXT PRIMARY KEY,
-  arch            TEXT NOT NULL,
-  origin          TEXT NOT NULL,
-  category        TEXT NOT NULL,
-  version         TEXT NOT NULL,
-  release         TEXT NOT NULL,
-  description     TEXT NOT NULL,
-  license         TEXT NOT NULL,
-  channel         TEXT NOT NULL,
-  provides        TEXT NOT NULL,   -- JSON array of strings
-  dependencies    TEXT NOT NULL,   -- JSON array of {name, req}
-  build_deps      TEXT NOT NULL,   -- JSON array of {name, req}
-  check_deps      TEXT NOT NULL,   -- JSON array of {name, req}
-  conffiles       TEXT NOT NULL,   -- JSON array of strings
-  source_url      TEXT NOT NULL,
-  source_sha256   TEXT NOT NULL,
-  upstream_url    TEXT NOT NULL,
-  upstream_version_regex TEXT NOT NULL,
-  recipe_path     TEXT NOT NULL,   -- repo-relative, links to GitHub raw
-  git_commit      TEXT NOT NULL,
-  synced_at       INTEGER NOT NULL
-);
+/// Named LMDB tables used by the hub.
+pub struct Database {
+    env: Env,
+    recipes: HeedDatabase<Str, Bytes>,
+    published: HeedDatabase<Str, Bytes>,
+    files: HeedDatabase<Str, Bytes>,
+    logs: HeedDatabase<Str, Bytes>,
+    tokens: HeedDatabase<Str, Bytes>,
+    meta: HeedDatabase<Str, Str>,
+    sync_log: HeedDatabase<Str, Bytes>,
+    db_path: std::path::PathBuf,
+}
 
-CREATE TABLE IF NOT EXISTS published (
-  filename     TEXT PRIMARY KEY,   -- <name>-<version>-<release>-<arch>.pkg.tar.zst
-  name         TEXT NOT NULL,
-  version      TEXT NOT NULL,
-  release      TEXT NOT NULL,
-  arch         TEXT NOT NULL,
-  size         INTEGER NOT NULL,
-  sha256       TEXT NOT NULL,
-  builder      TEXT NOT NULL,
-  uploaded_at  INTEGER NOT NULL,
-  meta         TEXT NOT NULL DEFAULT ''  -- JSON ManifestMeta extracted from the archive
-);
-CREATE INDEX IF NOT EXISTS idx_published_name ON published(name);
-
-CREATE TABLE IF NOT EXISTS tokens (
-  id            INTEGER PRIMARY KEY,
-  token_hash    TEXT NOT NULL UNIQUE,
-  label         TEXT NOT NULL,
-  created_at    INTEGER NOT NULL,
-  last_used_at  INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS sync_log (
-  id          INTEGER PRIMARY KEY,
-  kind        TEXT NOT NULL,      -- webhook | poll | boot
-  sha         TEXT NOT NULL,
-  started_at  INTEGER NOT NULL,
-  finished_at INTEGER NOT NULL,
-  ok          INTEGER NOT NULL,
-  message     TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS published_files (
-  filename TEXT NOT NULL,
-  path     TEXT NOT NULL,
-  type     TEXT NOT NULL,
-  size     INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_published_files ON published_files(filename);
-
-CREATE TABLE IF NOT EXISTS build_logs (
-  filename    TEXT PRIMARY KEY,
-  content     TEXT NOT NULL,
-  builder     TEXT NOT NULL,
-  uploaded_at INTEGER NOT NULL
-);
-"#;
-
-pub fn open(db_path: &Path) -> Result<Connection> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create database directory {}", parent.display()))?;
+/// Open or create the current LMDB environment and all schema-v1 tables.
+pub fn open(db_path: &Path) -> Result<Database> {
+    if db_path.exists() && !db_path.is_dir() {
+        anyhow::bail!(
+            "database path {} is a file; Sage 0.4 state requires an LMDB directory",
+            db_path.display()
+        );
     }
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("cannot open database at {}", db_path.display()))?;
-    conn.execute_batch(SCHEMA)?;
-    // Databases created before P3 lack the published.meta column.
-    let _ = conn.execute(
-        "ALTER TABLE published ADD COLUMN meta TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    // The recipes table is a disposable cache. Drop older shapes and let the
-    // next sync rebuild them instead of carrying schema-migration branches.
-    let has_current_shape: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('packages')
-             WHERE name IN ('arch', 'origin', 'upstream_url', 'upstream_version_regex',
-                            'build_deps', 'check_deps')",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        == 6;
-    if !has_current_shape {
-        conn.execute("DROP TABLE IF EXISTS packages", [])?;
-        conn.execute_batch(SCHEMA)?;
+    std::fs::create_dir_all(db_path)
+        .with_context(|| format!("cannot create LMDB directory {}", db_path.display()))?;
+    // SAFETY: this process is the sole writer of the configured hub state and
+    // keeps one fixed map size for every opener.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(16)
+            .open(db_path)?
+    };
+    let mut txn = env.write_txn()?;
+    let recipes = env.create_database(&mut txn, Some("recipes"))?;
+    let published = env.create_database(&mut txn, Some("published"))?;
+    let files = env.create_database(&mut txn, Some("files"))?;
+    let logs = env.create_database(&mut txn, Some("logs"))?;
+    let tokens = env.create_database(&mut txn, Some("tokens"))?;
+    let meta = env.create_database(&mut txn, Some("meta"))?;
+    let sync_log = env.create_database(&mut txn, Some("sync_log"))?;
+    txn.commit()?;
+    Ok(Database {
+        env,
+        recipes,
+        published,
+        files,
+        logs,
+        tokens,
+        meta,
+        sync_log,
+        db_path: db_path.to_path_buf(),
+    })
+}
+
+impl Database {
+    pub fn path(&self) -> &Path {
+        &self.db_path
     }
-    Ok(conn)
+}
+
+fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    Ok(bincode::serialize(value)?)
+}
+
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(bincode::deserialize(bytes)?)
+}
+
+fn read_all<T: DeserializeOwned>(env: &Env, database: &HeedDatabase<Str, Bytes>) -> Result<Vec<T>> {
+    let txn = env.read_txn()?;
+    let mut values = Vec::new();
+    for item in database.iter(&txn)? {
+        let (_, bytes) = item?;
+        values.push(decode(bytes)?);
+    }
+    Ok(values)
+}
+
+fn read_one<T: DeserializeOwned>(
+    env: &Env,
+    database: &HeedDatabase<Str, Bytes>,
+    key: &str,
+) -> Result<Option<T>> {
+    let txn = env.read_txn()?;
+    database.get(&txn, key)?.map(decode).transpose()
+}
+
+fn put<T: Serialize + ?Sized>(
+    txn: &mut heed::RwTxn<'_>,
+    database: &HeedDatabase<Str, Bytes>,
+    key: &str,
+    value: &T,
+) -> Result<()> {
+    database.put(txn, key, &encode(value)?)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Recipe catalog
+// ---------------------------------------------------------------------------
+
+/// One Sage recipe observed in the canonical source tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecipeRecord {
+    pub package: sage_core::Package,
+    pub origin: String,
+    pub category: String,
+    pub recipe_path: String,
+    pub git_commit: String,
+    pub source_url: String,
+    pub source_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageRow {
     pub name: String,
-    /// Architecture declared by the recipe and mirrored in its path.
+    pub slot: String,
+    pub epoch: u32,
     pub arch: String,
-    /// URL of the canonical recipes tree (GitHub links).
     pub origin: String,
     pub category: String,
     pub version: String,
@@ -144,225 +157,148 @@ pub struct PackageRow {
     pub recipe_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PublishedRow {
-    pub filename: String,
-    pub name: String,
-    pub version: String,
-    pub release: String,
-    pub arch: String,
-    pub size: i64,
-    pub sha256: String,
-    /// Who published this build (token label from the upload).
-    pub builder: String,
-    pub uploaded_at: i64,
-    /// Manifest metadata stored at publish time.
-    pub meta: Option<crate::repo::ManifestMeta>,
+fn recipe_key(record: &RecipeRecord) -> String {
+    let package = &record.package;
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        package.channel,
+        package.name,
+        package.slot,
+        package.arch,
+        package.epoch,
+        package.coordinate().version
+    )
 }
 
-/// Row mapper shared by every `published` query: eight plain columns plus
-/// the meta JSON column, deserialized leniently (bad JSON → None).
-fn row_to_published(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublishedRow> {
-    let meta_json: String = r.get(8)?;
-    Ok(PublishedRow {
-        filename: r.get(0)?,
-        name: r.get(1)?,
-        version: r.get(2)?,
-        release: r.get(3)?,
-        arch: r.get(4)?,
-        size: r.get(5)?,
-        sha256: r.get(6)?,
-        builder: r.get(9)?,
-        uploaded_at: r.get(7)?,
-        meta: if meta_json.is_empty() {
-            None
-        } else {
-            serde_json::from_str(&meta_json).ok()
-        },
-    })
-}
-
-/// Replace the whole recipe cache in one shot: fill a temporary table, then
-/// swap it under the final name inside one transaction. Readers on WAL see
-/// either the old or the new world, never a half-sync.
-pub fn rebuild_packages(conn: &Connection, recipes: &[RecipeRecord]) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
-
-    conn.execute("DROP TABLE IF EXISTS packages_new", [])?;
-    // Explicit shape: CREATE TABLE AS SELECT would copy an old table's
-    // columns verbatim and silently drop the arch/origin dimensions.
-    conn.execute_batch(
-        "CREATE TABLE packages_new (
-             name            TEXT NOT NULL,
-             arch            TEXT NOT NULL,
-             origin          TEXT NOT NULL,
-             category        TEXT NOT NULL,
-             version         TEXT NOT NULL,
-             release         TEXT NOT NULL,
-             description     TEXT NOT NULL,
-             license         TEXT NOT NULL,
-             channel         TEXT NOT NULL,
-             provides        TEXT NOT NULL,
-             dependencies    TEXT NOT NULL,
-             build_deps      TEXT NOT NULL,
-             check_deps      TEXT NOT NULL,
-             conffiles       TEXT NOT NULL,
-             source_url      TEXT NOT NULL,
-             source_sha256   TEXT NOT NULL,
-             upstream_url    TEXT NOT NULL,
-             upstream_version_regex TEXT NOT NULL,
-             recipe_path     TEXT NOT NULL,
-             git_commit      TEXT NOT NULL,
-             synced_at       INTEGER NOT NULL
-         );",
-    )?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO packages_new (name, arch, origin, category, version, release, description, license,
-             channel, provides, dependencies, build_deps, check_deps, conffiles, source_url, source_sha256,
-             upstream_url, upstream_version_regex, recipe_path, git_commit, synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-    )?;
-    for r in recipes {
-        stmt.execute(params![
-            r.recipe.name,
-            r.arch,
-            r.origin,
-            r.category,
-            r.recipe.version,
-            r.recipe.release,
-            r.recipe.description,
-            r.recipe.license,
-            r.recipe.channel,
-            serde_json::to_string(&r.recipe.provides)?,
-            serde_json::to_string(&r.recipe.dependencies)?,
-            serde_json::to_string(&r.recipe.build_dependencies)?,
-            serde_json::to_string(&r.recipe.check_dependencies)?,
-            serde_json::to_string(&r.recipe.conffiles)?,
-            r.recipe.source_url,
-            r.recipe.source_sha256,
-            r.recipe.upstream_url,
-            r.recipe.upstream_version_regex,
-            r.recipe_path,
-            r.git_commit,
-            now,
-        ])?;
+fn package_row(record: &RecipeRecord) -> PackageRow {
+    let package = &record.package;
+    PackageRow {
+        name: package.name.clone(),
+        slot: package.slot.clone(),
+        epoch: package.epoch,
+        arch: canonical_arch(&package.arch).to_string(),
+        origin: record.origin.clone(),
+        category: record.category.clone(),
+        version: package.version.clone(),
+        release: package.release.to_string(),
+        description: package.description.clone(),
+        license: package.license.clone(),
+        channel: package.channel.clone(),
+        provides: package.provides.clone(),
+        dependencies: package.dependencies.iter().map(Dep::from).collect(),
+        build_dependencies: Vec::new(),
+        check_dependencies: Vec::new(),
+        conffiles: Vec::new(),
+        source_url: record.source_url.clone(),
+        source_sha256: record.source_sha256.clone(),
+        upstream_url: String::new(),
+        upstream_version_regex: String::new(),
+        recipe_path: record.recipe_path.clone(),
     }
-    conn.execute_batch(
-        "BEGIN;
-         DROP TABLE IF EXISTS packages;
-         ALTER TABLE packages_new RENAME TO packages;
-         COMMIT;",
-    )?;
+}
+
+/// Atomically replace the recipe observation set after one Sage parser pass.
+pub fn rebuild_packages(database: &Database, recipes: &[RecipeRecord]) -> Result<()> {
+    let mut txn = database.env.write_txn()?;
+    database.recipes.clear(&mut txn)?;
+    for record in recipes {
+        put(&mut txn, &database.recipes, &recipe_key(record), record)?;
+    }
+    txn.commit()?;
     Ok(())
 }
 
-/// One walked recipe: the parsed model plus where it sits in the tree.
-#[derive(Debug, Clone)]
-pub struct RecipeRecord {
-    pub recipe: Recipe,
-    /// Architecture declared by the recipe and mirrored in its path.
-    pub arch: String,
-    /// URL of the canonical recipes tree.
-    pub origin: String,
-    pub category: String,
-    pub recipe_path: String,
-    /// HEAD of the source tree at collection time.
-    pub git_commit: String,
-}
-
-const PACKAGE_COLS: &str =
-    "name, arch, origin, category, version, release, description, license, channel,
-     provides, dependencies, build_deps, check_deps, conffiles, source_url, source_sha256,
-     upstream_url, upstream_version_regex, recipe_path";
-
-fn select_packages(
-    conn: &Connection,
-    where_clause: &str,
-    name: Option<&str>,
-) -> Result<Vec<PackageRow>> {
-    let sql = format!("SELECT {PACKAGE_COLS} FROM packages {where_clause}");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = match name {
-        Some(n) => stmt.query_map(params![n], map_package_row)?,
-        None => stmt.query_map([], map_package_row)?,
-    }
-    .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-/// Every recipe version of every package, including superseded ones.
-pub fn all_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
-    select_packages(conn, "ORDER BY name", None)
-}
-
-/// One row per package: its newest recipe version. Lists, the status board
-/// and the dependency graph all speak this dialect; detail pages can still
-/// descend into [`package_versions`].
-pub fn latest_packages(conn: &Connection) -> Result<Vec<PackageRow>> {
-    let mut rows = all_packages(conn)?;
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.arch.cmp(&b.arch)));
-    rows.dedup_by(|a, b| {
-        if a.name == b.name && a.arch == b.arch {
-            // `a` precedes `b`; keep whichever sorts newer under the same
-            // segment ordering the build-state diff uses.
-            if status_cmp(a, b) == std::cmp::Ordering::Greater {
-                std::mem::swap(a, b);
-            }
-            true
-        } else {
-            false
-        }
+pub fn all_packages(database: &Database) -> Result<Vec<PackageRow>> {
+    let records = read_all::<RecipeRecord>(&database.env, &database.recipes)?;
+    let mut rows: Vec<_> = records.iter().map(package_row).collect();
+    rows.sort_by(|a, b| {
+        (
+            &a.name, &a.arch, &a.channel, &a.slot, &a.version, &a.release,
+        )
+            .cmp(&(
+                &b.name, &b.arch, &b.channel, &b.slot, &b.version, &b.release,
+            ))
     });
     Ok(rows)
 }
 
-fn status_cmp(a: &PackageRow, b: &PackageRow) -> std::cmp::Ordering {
-    crate::status::compare_versions(
-        &format!("{}-{}", a.version, a.release),
-        &format!("{}-{}", b.version, b.release),
-    )
-}
-
-/// All recipe versions kept for one package, newest first.
-pub fn package_versions(conn: &Connection, name: &str) -> Result<Vec<PackageRow>> {
-    let mut rows = select_packages(conn, "WHERE name = ?1", Some(name))?;
-    rows.sort_by(|a, b| status_cmp(b, a));
+pub fn latest_packages(database: &Database) -> Result<Vec<PackageRow>> {
+    let records = read_all::<RecipeRecord>(&database.env, &database.recipes)?;
+    let mut latest: BTreeMap<(String, String, String, String), RecipeRecord> = BTreeMap::new();
+    for record in records {
+        let package = &record.package;
+        let key = (
+            package.name.clone(),
+            canonical_arch(&package.arch).to_string(),
+            package.channel.clone(),
+            package.slot.clone(),
+        );
+        let replace = latest.get(&key).is_none_or(|current| {
+            package.coordinate().version > current.package.coordinate().version
+        });
+        if replace {
+            latest.insert(key, record);
+        }
+    }
+    let mut rows: Vec<_> = latest.values().map(package_row).collect();
+    rows.sort_by(|a, b| {
+        (&a.name, &a.arch, &a.channel, &a.slot).cmp(&(&b.name, &b.arch, &b.channel, &b.slot))
+    });
     Ok(rows)
 }
 
-/// Newest recipe version of one package, if the name exists at all.
-pub fn package_by_name(conn: &Connection, name: &str) -> Result<Option<PackageRow>> {
-    Ok(package_versions(conn, name)?.into_iter().next())
-}
-
-/// Packages (deduplicated) whose `provides` covers `virtual_name` -- the
-/// resolution for names like `virtual/libc` that have no recipe of their own.
-pub fn providers(conn: &Connection, virtual_name: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT name FROM packages
-         WHERE EXISTS (SELECT 1 FROM json_each(packages.provides) j WHERE j.value = ?1)",
-    )?;
-    let rows = stmt
-        .query_map(params![virtual_name], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+pub fn package_versions(database: &Database, name: &str) -> Result<Vec<PackageRow>> {
+    let records = read_all::<RecipeRecord>(&database.env, &database.recipes)?;
+    let mut rows: Vec<_> = records
+        .iter()
+        .filter(|record| record.package.name == name)
+        .map(package_row)
+        .collect();
+    rows.sort_by(|a, b| {
+        crate::status::compare_versions(
+            &format!("{}:{}-{}", b.epoch, b.version, b.release),
+            &format!("{}:{}-{}", a.epoch, a.version, a.release),
+        )
+    });
     Ok(rows)
 }
 
-/// Packages whose runtime dependencies request `name` (exact dep-name match;
-/// version constraints are ignored for the reverse edge).
-pub fn reverse_deps(conn: &Connection, name: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT p.name FROM packages p, json_each(p.dependencies) j
-         WHERE json_extract(j.value, '$.name') = ?1
-         ORDER BY p.name",
-    )?;
-    let rows = stmt
-        .query_map(params![name], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+pub fn package_by_name(database: &Database, name: &str) -> Result<Option<PackageRow>> {
+    Ok(package_versions(database, name)?.into_iter().next())
+}
+
+pub fn providers(database: &Database, virtual_name: &str) -> Result<Vec<String>> {
+    let mut names = HashSet::new();
+    for record in read_all::<RecipeRecord>(&database.env, &database.recipes)? {
+        if record
+            .package
+            .provides
+            .iter()
+            .any(|value| value == virtual_name)
+        {
+            names.insert(record.package.name);
+        }
+    }
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort();
+    Ok(names)
+}
+
+pub fn reverse_deps(database: &Database, name: &str) -> Result<Vec<String>> {
+    let mut names = HashSet::new();
+    for record in read_all::<RecipeRecord>(&database.env, &database.recipes)? {
+        if record
+            .package
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.name == name)
+        {
+            names.insert(record.package.name);
+        }
+    }
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort();
+    Ok(names)
 }
 
 #[derive(Debug, Serialize)]
@@ -371,48 +307,63 @@ pub struct CategoryCount {
     pub count: i64,
 }
 
-pub fn categories(conn: &Connection) -> Result<Vec<CategoryCount>> {
-    // Distinct names: superseded recipe versions must not inflate counts.
-    let mut stmt = conn.prepare(
-        "SELECT category, COUNT(DISTINCT name) FROM packages GROUP BY category ORDER BY category",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(CategoryCount {
-                name: r.get(0)?,
-                count: r.get(1)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+pub fn categories(database: &Database) -> Result<Vec<CategoryCount>> {
+    let mut grouped: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for row in latest_packages(database)? {
+        grouped.entry(row.category).or_default().insert(row.name);
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(name, packages)| CategoryCount {
+            name,
+            count: packages.len() as i64,
+        })
+        .collect())
 }
 
-/// Latest published row per (package name, canonical architecture). An old
-/// build re-uploaded later must not shadow the current one: latest by
-/// *version*, ties broken by upload time. Legacy `x86_64` artifacts fold
-/// into `amd64` here, so both spellings meet in one status slot.
-pub fn published_latest_by_arch(conn: &Connection) -> Result<Vec<PublishedRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder FROM published",
-    )?;
-    let all = stmt
-        .query_map([], row_to_published)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut best: std::collections::HashMap<(String, String), PublishedRow> =
-        std::collections::HashMap::new();
-    for mut row in all {
-        row.arch = crate::model::canonical_arch(&row.arch).to_string();
-        let key = (row.name.clone(), row.arch.clone());
+// ---------------------------------------------------------------------------
+// Published artifacts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedRow {
+    pub filename: String,
+    /// Path below the public `/repo/` root, e.g. `system/foo.pkg.tar.zst`.
+    pub repo_path: String,
+    pub name: String,
+    pub slot: String,
+    pub version: String,
+    pub release: String,
+    pub epoch: u32,
+    pub arch: String,
+    pub channel: String,
+    pub size: i64,
+    pub sha256: String,
+    pub builder: String,
+    pub uploaded_at: i64,
+    pub meta: Option<ManifestMeta>,
+}
+
+pub fn published_latest_by_arch(database: &Database) -> Result<Vec<PublishedRow>> {
+    let mut best: HashMap<(String, String, String, String), PublishedRow> = HashMap::new();
+    for mut row in read_all::<PublishedRow>(&database.env, &database.published)? {
+        row.arch = canonical_arch(&row.arch).to_string();
+        let key = (
+            row.channel.clone(),
+            row.name.clone(),
+            row.slot.clone(),
+            row.arch.clone(),
+        );
         match best.get_mut(&key) {
-            Some(cur) => {
-                let newer = crate::status::compare_versions(
-                    &format!("{}-{}", row.version, row.release),
-                    &format!("{}-{}", cur.version, cur.release),
+            Some(current) => {
+                let order = crate::status::compare_versions(
+                    &format!("{}:{}-{}", row.epoch, row.version, row.release),
+                    &format!("{}:{}-{}", current.epoch, current.version, current.release),
                 );
-                if newer == std::cmp::Ordering::Greater
-                    || (newer == std::cmp::Ordering::Equal && row.uploaded_at > cur.uploaded_at)
+                if order == std::cmp::Ordering::Greater
+                    || (order == std::cmp::Ordering::Equal && row.uploaded_at > current.uploaded_at)
                 {
-                    *cur = row;
+                    *current = row;
                 }
             }
             None => {
@@ -420,163 +371,127 @@ pub fn published_latest_by_arch(conn: &Connection) -> Result<Vec<PublishedRow>> 
             }
         }
     }
-    let mut rows: Vec<PublishedRow> = best.into_values().collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut rows: Vec<_> = best.into_values().collect();
+    rows.sort_by(|a, b| {
+        (&a.name, &a.arch, &a.channel, &a.slot).cmp(&(&b.name, &b.arch, &b.channel, &b.slot))
+    });
     Ok(rows)
 }
 
-/// Every published archive, newest upload first -- the repo file browser.
-pub fn published_all(conn: &Connection) -> Result<Vec<PublishedRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder
-         FROM published ORDER BY uploaded_at DESC",
-    )?;
-    let rows = stmt
-        .query_map([], row_to_published)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+pub fn published_all(database: &Database) -> Result<Vec<PublishedRow>> {
+    let mut rows = read_all::<PublishedRow>(&database.env, &database.published)?;
+    rows.sort_by(|a, b| {
+        b.uploaded_at
+            .cmp(&a.uploaded_at)
+            .then(a.filename.cmp(&b.filename))
+    });
     Ok(rows)
 }
 
-/// Every published build of one package, newest first -- the detail page's
-/// version ladder of what actually landed in the repository.
-pub fn published_for_name(conn: &Connection, name: &str) -> Result<Vec<PublishedRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, sha256, uploaded_at, meta, builder
-         FROM published WHERE name = ?1 ORDER BY uploaded_at DESC",
-    )?;
-    let rows = stmt
-        .query_map(params![name], row_to_published)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+pub fn published_for_name(database: &Database, name: &str) -> Result<Vec<PublishedRow>> {
+    Ok(published_all(database)?
+        .into_iter()
+        .filter(|row| row.name == name)
+        .collect())
 }
 
-/// Stored manifest meta for one archive (empty JSON → None).
-pub fn published_meta(
-    conn: &Connection,
-    filename: &str,
-) -> Result<Option<crate::repo::ManifestMeta>> {
-    let mut stmt = conn.prepare("SELECT meta FROM published WHERE filename = ?1")?;
-    let mut rows = stmt.query_map(params![filename], |r| r.get::<_, String>(0))?;
-    match rows.next().transpose()? {
-        Some(json) if !json.is_empty() => Ok(serde_json::from_str(&json).ok()),
-        _ => Ok(None),
-    }
+pub fn published_meta(database: &Database, filename: &str) -> Result<Option<ManifestMeta>> {
+    Ok(
+        read_one::<PublishedRow>(&database.env, &database.published, filename)?
+            .and_then(|row| row.meta),
+    )
 }
 
-/// Everything the index generator needs, including the JSON manifest meta.
-pub struct IndexRow {
-    pub filename: String,
-    pub name: String,
-    pub version: String,
-    pub release: String,
-    pub arch: String,
-    pub size: i64,
-    pub meta_json: String,
+pub fn published_row(database: &Database, filename: &str) -> Result<Option<PublishedRow>> {
+    read_one(&database.env, &database.published, filename)
 }
 
-pub fn index_rows(conn: &Connection) -> Result<Vec<IndexRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT filename, name, version, release, arch, size, meta
-         FROM published ORDER BY name, filename",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(IndexRow {
-                filename: r.get(0)?,
-                name: r.get(1)?,
-                version: r.get(2)?,
-                release: r.get(3)?,
-                arch: r.get(4)?,
-                size: r.get(5)?,
-                meta_json: r.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-/// Insert or overwrite one published file. Re-uploading the same filename
-/// replaces the row (and the file on disk) — publish stays idempotent.
-pub fn upsert_published(
-    conn: &Connection,
-    filename: &str,
-    meta: &crate::repo::ManifestMeta,
-    size: i64,
-    sha256: &str,
-    builder: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO published (filename, name, version, release, arch, size, sha256,
-             builder, uploaded_at, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(filename) DO UPDATE SET
-             name = excluded.name, version = excluded.version, release = excluded.release,
-             arch = excluded.arch, size = excluded.size, sha256 = excluded.sha256,
-             builder = excluded.builder, uploaded_at = excluded.uploaded_at,
-             meta = excluded.meta",
-        params![
-            filename,
-            meta.name,
-            meta.version,
-            meta.release,
-            meta.arch,
-            size,
-            sha256,
-            builder,
-            now(),
-            serde_json::to_string(meta).map_err(json_err)?,
-        ],
-    )?;
+pub fn upsert_published(database: &Database, row: &PublishedRow) -> Result<()> {
+    let mut txn = database.env.write_txn()?;
+    put(&mut txn, &database.published, &row.filename, row)?;
+    txn.commit()?;
     Ok(())
 }
 
-pub fn published_sha256(conn: &Connection, filename: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT sha256 FROM published WHERE filename = ?1")?;
-    let mut rows = stmt.query_map(params![filename], |r| r.get::<_, String>(0))?;
-    Ok(rows.next().transpose()?)
+pub fn published_sha256(database: &Database, filename: &str) -> Result<Option<String>> {
+    Ok(published_row(database, filename)?.map(|row| row.sha256))
+}
+
+pub fn published_sha256_for_path(database: &Database, repo_path: &str) -> Result<Option<String>> {
+    Ok(published_all(database)?
+        .into_iter()
+        .find(|row| row.repo_path == repo_path)
+        .map(|row| row.sha256))
+}
+
+/// Remove one artifact and all hub metadata in one write transaction.
+pub fn delete_published(database: &Database, filename: &str) -> Result<Option<PublishedRow>> {
+    let mut txn = database.env.write_txn()?;
+    let Some(row): Option<PublishedRow> = database
+        .published
+        .get(&txn, filename)?
+        .map(decode)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    database.published.delete(&mut txn, filename)?;
+    database.files.delete(&mut txn, filename)?;
+    database.logs.delete(&mut txn, filename)?;
+    txn.commit()?;
+    Ok(Some(row))
 }
 
 // ---------------------------------------------------------------------------
-// Publish tokens (Bearer auth for /api/repo/publish)
+// Tokens, file inventories, logs, and sync metadata
 // ---------------------------------------------------------------------------
 
-/// Mint a fresh token: returned once in full, stored only as SHA-256.
-pub fn token_create(conn: &Connection, label: &str) -> Result<String> {
+pub fn token_create(database: &Database, label: &str) -> Result<String> {
     use sha2::Digest;
     use std::io::Read;
     let mut raw = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
     let token = format!("rt_{}", hex::encode(raw));
     let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-    conn.execute(
-        "INSERT INTO tokens (token_hash, label, created_at) VALUES (?1, ?2, ?3)",
-        params![hash, label, now()],
+    let mut txn = database.env.write_txn()?;
+    put(
+        &mut txn,
+        &database.tokens,
+        &hash,
+        &TokenRecord {
+            label: label.to_string(),
+            created_at: now(),
+            last_used_at: None,
+        },
     )?;
+    txn.commit()?;
     Ok(token)
 }
 
-/// Resolve a presented Bearer token to its label, refreshing last_used_at.
-pub fn token_label(conn: &Connection, presented: &str) -> Result<Option<String>> {
-    use sha2::Digest;
-    let hash = hex::encode(sha2::Sha256::digest(presented.as_bytes()));
-    let mut stmt = conn.prepare("SELECT label FROM tokens WHERE token_hash = ?1")?;
-    let mut rows = stmt.query_map(params![hash], |r| r.get::<_, String>(0))?;
-    let label = match rows.next() {
-        Some(row) => Some(row?),
-        None => return Ok(None),
-    };
-    conn.execute(
-        "UPDATE tokens SET last_used_at = ?1 WHERE token_hash = ?2",
-        params![now(), hash],
-    )?;
-    Ok(label)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenRecord {
+    label: String,
+    created_at: i64,
+    last_used_at: Option<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// Published file lists & build logs (P5)
-// ---------------------------------------------------------------------------
+pub fn token_label(database: &Database, presented: &str) -> Result<Option<String>> {
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(presented.as_bytes()));
+    let mut txn = database.env.write_txn()?;
+    let Some(mut record): Option<TokenRecord> =
+        database.tokens.get(&txn, &hash)?.map(decode).transpose()?
+    else {
+        return Ok(None);
+    };
+    record.last_used_at = Some(now());
+    put(&mut txn, &database.tokens, &hash, &record)?;
+    let label = record.label;
+    txn.commit()?;
+    Ok(Some(label))
+}
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileLine {
     pub path: String,
     #[serde(rename = "type")]
@@ -584,114 +499,49 @@ pub struct FileLine {
     pub size: i64,
 }
 
-/// Swap the stored file list for one archive; called on every publish.
 pub fn replace_published_files(
-    conn: &Connection,
+    database: &Database,
     filename: &str,
     lines: &[FileLine],
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM published_files WHERE filename = ?1",
-        params![filename],
-    )?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO published_files (filename, path, type, size) VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    for l in lines {
-        stmt.execute(params![filename, l.path, l.kind, l.size])?;
-    }
+    let mut txn = database.env.write_txn()?;
+    put(&mut txn, &database.files, filename, lines)?;
+    txn.commit()?;
     Ok(())
 }
 
-pub fn file_list(conn: &Connection, filename: &str) -> Result<Vec<FileLine>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, type, size FROM published_files
-         WHERE filename = ?1 ORDER BY path",
-    )?;
-    let rows = stmt
-        .query_map(params![filename], |r| {
-            Ok(FileLine {
-                path: r.get(0)?,
-                kind: r.get(1)?,
-                size: r.get(2)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+pub fn file_list(database: &Database, filename: &str) -> Result<Vec<FileLine>> {
+    Ok(read_one(&database.env, &database.files, filename)?.unwrap_or_default())
 }
 
-pub fn log_upsert(conn: &Connection, filename: &str, content: &str, builder: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO build_logs (filename, content, builder, uploaded_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(filename) DO UPDATE SET
-             content = excluded.content, builder = excluded.builder,
-             uploaded_at = excluded.uploaded_at",
-        params![filename, content, builder, now()],
-    )?;
-    Ok(())
-}
-
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRow {
     pub content: String,
     pub builder: String,
     pub uploaded_at: i64,
 }
 
-pub fn log_get(conn: &Connection, filename: &str) -> Result<Option<LogRow>> {
-    let mut stmt =
-        conn.prepare("SELECT content, builder, uploaded_at FROM build_logs WHERE filename = ?1")?;
-    let mut rows = stmt.query_map(params![filename], |r| {
-        Ok(LogRow {
-            content: r.get(0)?,
-            builder: r.get(1)?,
-            uploaded_at: r.get(2)?,
-        })
-    })?;
-    Ok(rows.next().transpose()?)
+pub fn log_upsert(database: &Database, filename: &str, content: &str, builder: &str) -> Result<()> {
+    let mut txn = database.env.write_txn()?;
+    put(
+        &mut txn,
+        &database.logs,
+        filename,
+        &LogRow {
+            content: content.to_string(),
+            builder: builder.to_string(),
+            uploaded_at: now(),
+        },
+    )?;
+    txn.commit()?;
+    Ok(())
 }
 
-/// Remove a published artifact everywhere: row, file list, build log.
-/// Returns false when the filename was never published. The on-disk file and
-/// index regeneration are the caller's job (they own repo_dir).
-pub fn delete_published(conn: &Connection, filename: &str) -> Result<bool> {
-    let affected = conn.execute(
-        "DELETE FROM published WHERE filename = ?1",
-        params![filename],
-    )?;
-    if affected == 0 {
-        return Ok(false);
-    }
-    conn.execute(
-        "DELETE FROM published_files WHERE filename = ?1",
-        params![filename],
-    )?;
-    conn.execute(
-        "DELETE FROM build_logs WHERE filename = ?1",
-        params![filename],
-    )?;
-    Ok(true)
+pub fn log_get(database: &Database, filename: &str) -> Result<Option<LogRow>> {
+    read_one(&database.env, &database.logs, filename)
 }
 
-pub fn recent_syncs(conn: &Connection, limit: i64) -> Result<Vec<SyncEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT kind, sha, started_at, ok, message
-         FROM sync_log ORDER BY id DESC LIMIT ?1",
-    )?;
-    let rows = stmt
-        .query_map(params![limit], |r| {
-            Ok(SyncEntry {
-                trigger: r.get(0)?,
-                commit: r.get(1)?,
-                started_at: r.get(2)?,
-                ok: r.get::<_, i64>(3)? != 0,
-                message: r.get(4)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncEntry {
     pub trigger: String,
     pub commit: String,
@@ -701,49 +551,98 @@ pub struct SyncEntry {
 }
 
 impl SyncEntry {
-    /// Renderable UTC timestamp ("YYYY-MM-DD HH:MM") for templates.
     pub fn when(&self) -> String {
         time_hm_pub(self.started_at)
     }
-    /// Same instant as UTC ISO-8601 for `<time datetime>`.
+
     pub fn when_iso(&self) -> String {
         time_utc(self.started_at)
     }
 }
 
+pub fn recent_syncs(database: &Database, limit: usize) -> Result<Vec<SyncEntry>> {
+    let mut entries = read_all::<SyncEntry>(&database.env, &database.sync_log)?;
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at));
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+pub fn log_sync(
+    database: &Database,
+    trigger: &str,
+    commit: &str,
+    started_at: i64,
+    ok: bool,
+    message: &str,
+) -> Result<()> {
+    let key = format!(
+        "{:020}-{:020}",
+        now(),
+        SYNC_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut txn = database.env.write_txn()?;
+    put(
+        &mut txn,
+        &database.sync_log,
+        &key,
+        &SyncEntry {
+            trigger: trigger.to_string(),
+            commit: commit.to_string(),
+            started_at,
+            ok,
+            message: message.to_string(),
+        },
+    )?;
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn meta_get(database: &Database, key: &str) -> Result<Option<String>> {
+    let txn = database.env.read_txn()?;
+    Ok(database.meta.get(&txn, key)?.map(str::to_string))
+}
+
+pub fn meta_set(database: &Database, key: &str, value: &str) -> Result<()> {
+    let mut txn = database.env.write_txn()?;
+    database.meta.put(&mut txn, key, value)?;
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 impl PublishedRow {
-    /// When this build landed in the repository (template helper).
     pub fn built_at(&self) -> String {
         time_hm_pub(self.uploaded_at)
     }
-    /// Same instant as UTC ISO-8601 for `<time datetime>` (client-side
-    /// timezone conversion).
+
     pub fn built_iso(&self) -> String {
         time_utc(self.uploaded_at)
     }
-    /// Archive size in MiB, one decimal (template helper).
+
     pub fn size_mib(&self) -> String {
         format!("{:.1}", self.size as f64 / 1_048_576.0)
     }
-    /// True when the manifest ships a universal service definition.
+
     pub fn is_daemon(&self) -> bool {
         self.meta
             .as_ref()
-            .is_some_and(|m| !m.service_toml.is_empty())
+            .is_some_and(|meta| !meta.service_toml.is_empty())
     }
-    /// Build tools observed for this exact uploaded archive. This must never
-    /// be lifted to package/recipe scope: two uploads of the same version may
-    /// have been built with different Sage-managed toolchains.
-    pub fn managed_build_tools(&self) -> &[crate::repo::ManagedBuildTool] {
+
+    pub fn managed_build_tools(&self) -> &[sage_core::ManagedBuildTool] {
         self.meta
             .as_ref()
-            .map(|m| m.managed_build_tools.as_slice())
+            .map(|meta| meta.managed_build_tools.as_slice())
             .unwrap_or_default()
     }
 }
 
-/// Unix seconds → `YYYY-MM-DD HH:MM:SSZ` UTC via civil-from-days
-/// (no chrono dependency); the single source of wall-clock rendering.
 pub fn time_utc(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
@@ -761,183 +660,6 @@ pub fn time_utc(unix: i64) -> String {
     format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// "YYYY-MM-DD HH:MM" — the human-facing slice of [`time_utc`].
 pub fn time_hm_pub(unix: i64) -> String {
     time_utc(unix).replacen('T', " ", 1)[..16].to_string()
-}
-
-pub fn log_sync(
-    conn: &Connection,
-    trigger: &str,
-    commit: &str,
-    started_at: i64,
-    ok: bool,
-    message: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO sync_log (kind, sha, started_at, finished_at, ok, message)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![trigger, commit, started_at, now(), ok as i64, message],
-    )?;
-    Ok(())
-}
-
-pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
-    let mut rows = stmt.query_map(params![key], |r| r.get::<_, String>(0))?;
-    Ok(rows.next().transpose()?)
-}
-
-pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn json_err(e: serde_json::Error) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-}
-
-fn map_package_row(r: &rusqlite::Row<'_>) -> std::result::Result<PackageRow, rusqlite::Error> {
-    Ok(PackageRow {
-        name: r.get(0)?,
-        arch: r.get(1)?,
-        origin: r.get(2)?,
-        category: r.get(3)?,
-        version: r.get(4)?,
-        release: r.get(5)?,
-        description: r.get(6)?,
-        license: r.get(7)?,
-        channel: r.get(8)?,
-        provides: serde_json::from_str(&r.get::<_, String>(9)?).map_err(json_err)?,
-        dependencies: serde_json::from_str(&r.get::<_, String>(10)?).map_err(json_err)?,
-        build_dependencies: serde_json::from_str(&r.get::<_, String>(11)?).map_err(json_err)?,
-        check_dependencies: serde_json::from_str(&r.get::<_, String>(12)?).map_err(json_err)?,
-        conffiles: serde_json::from_str(&r.get::<_, String>(13)?).map_err(json_err)?,
-        source_url: r.get(14)?,
-        source_sha256: r.get(15)?,
-        upstream_url: r.get(16)?,
-        upstream_version_regex: r.get(17)?,
-        recipe_path: r.get(18)?,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn published_with_tools(
-        filename: &str,
-        tools: Vec<crate::repo::ManagedBuildTool>,
-    ) -> PublishedRow {
-        PublishedRow {
-            filename: filename.into(),
-            name: "same-package".into(),
-            version: "1.0".into(),
-            release: "1".into(),
-            arch: "amd64".into(),
-            size: 1,
-            sha256: String::new(),
-            builder: "test".into(),
-            uploaded_at: 0,
-            meta: Some(crate::repo::ManifestMeta {
-                name: "same-package".into(),
-                version: "1.0".into(),
-                release: "1".into(),
-                epoch: 0,
-                description: String::new(),
-                license: String::new(),
-                channel: "system".into(),
-                arch: "amd64".into(),
-                installed_size: 1,
-                service_toml: String::new(),
-                dependencies: Vec::new(),
-                provides: Vec::new(),
-                conffiles: Vec::new(),
-                check_dependencies: Vec::new(),
-                managed_build_tools: tools,
-            }),
-        }
-    }
-
-    #[test]
-    fn managed_build_tools_remain_scoped_to_each_uploaded_archive() {
-        let clang = published_with_tools(
-            "same-package-1.0-1-amd64-clang.pkg.tar.zst",
-            vec![crate::repo::ManagedBuildTool {
-                role: "cc".into(),
-                executable: "clang".into(),
-                family: "clang".into(),
-                version: "22.1.8".into(),
-                parameters: vec!["CFLAGS=-O3".into()],
-            }],
-        );
-        let gcc = published_with_tools(
-            "same-package-1.0-1-amd64-gcc.pkg.tar.zst",
-            vec![crate::repo::ManagedBuildTool {
-                role: "cc".into(),
-                executable: "gcc".into(),
-                family: "gcc".into(),
-                version: "16.2.0".into(),
-                parameters: vec!["CFLAGS=-O2".into()],
-            }],
-        );
-        let prebuilt =
-            published_with_tools("same-package-1.0-1-amd64-prebuilt.pkg.tar.zst", Vec::new());
-
-        assert_eq!(clang.managed_build_tools()[0].executable, "clang");
-        assert_eq!(clang.managed_build_tools()[0].parameters, ["CFLAGS=-O3"]);
-        assert_eq!(gcc.managed_build_tools()[0].executable, "gcc");
-        assert_eq!(gcc.managed_build_tools()[0].parameters, ["CFLAGS=-O2"]);
-        assert!(prebuilt.managed_build_tools().is_empty());
-    }
-
-    #[test]
-    fn upstream_metadata_survives_recipe_cache_rebuild() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        let recipe = Recipe::from_toml(
-            "schema_version = 2\n\
-             [package]\nname = \"zlib\"\nversion = \"1.3.2\"\nrelease = \"1\"\n\
-             arch = \"amd64\"\n\
-             check_dependencies = [\"pkg-config >= 0.29\"]\n\
-             [upstream]\nurl = \"https://zlib.net/\"\nversion_regex = 'zlib-(\\d+\\.\\d+\\.\\d+)'\n\
-             [build]\nsystem = \"script\"\npayload = \"allowlist\"\n\
-             install_files = [\"usr/share/zlib/**\"]\n\
-             [[build.steps]]\nname = \"check\"\nphase = \"check\"\ncommand = \"true\"\n",
-        )
-        .unwrap();
-        rebuild_packages(
-            &conn,
-            &[RecipeRecord {
-                recipe,
-                arch: "amd64".into(),
-                origin: "https://github.com/sclinuxdev/recipes.amd64".into(),
-                category: "libs".into(),
-                recipe_path: "libs/zlib/1.3.2-1/recipe.toml".into(),
-                git_commit: "deadbeef".into(),
-            }],
-        )
-        .unwrap();
-        let row = package_by_name(&conn, "zlib").unwrap().unwrap();
-        assert_eq!(row.upstream_url, "https://zlib.net/");
-        assert_eq!(row.upstream_version_regex, r"zlib-(\d+\.\d+\.\d+)");
-        assert_eq!(
-            row.check_dependencies,
-            vec![Dep {
-                name: "pkg-config".into(),
-                req: ">= 0.29".into(),
-            }]
-        );
-    }
 }

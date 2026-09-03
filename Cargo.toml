@@ -11,18 +11,26 @@ anyhow = "1"
 askama = "0.14"
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+heed = "0.21"
+bincode = "1.3"
 hex = "0.4"
 hmac = "0.12"
-rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.9"
 ureq = "2"
-zstd = "0.13"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
+# Sage 0.4 is the canonical package and repository implementation. The
+# sibling checkout is intentional: both projects share Sage's LMDB/bincode
+# wire format.
+sage-core = { path = "../sage/crates/sage-core", version = "0.4.0" }
+sage-build = { path = "../sage/crates/sage-build", version = "0.4.0" }
+sage-archive = { path = "../sage/crates/sage-archive", version = "0.4.0" }
+sage-repo = { path = "../sage/crates/sage-repo", version = "0.4.0" }
 
 [[bin]]
 name = "recipedia-server"

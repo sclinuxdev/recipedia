@@ -3,13 +3,13 @@
 {% block content %}
 <h1>Repository Files</h1>
 <p class="muted">{{ files.len() }} archive(s) · {{ total_mib }} MiB total ·
-   <a href="index.toml" class="mono">index.toml</a> is the channel index sage reads.</p>
+   Sage 0.4 reads signed <span class="mono">index.mdb.zst</span> files per subchannel.</p>
 <table>
   <thead><tr><th>File</th><th>Package</th><th>Version</th><th>Arch</th><th class="num">Size</th><th>Uploaded</th></tr></thead>
   <tbody>
   {% for f in files %}
     <tr>
-      <td class="mono"><a href="{{ f.filename }}">{{ f.filename }}</a></td>
+      <td class="mono"><a href="{{ nav.repo }}/{{ f.repo_path }}">{{ f.repo_path }}</a></td>
       <td>{{ f.name }}</td>
       <td class="mono">{{ f.version }}-{{ f.release }}</td>
       <td>{{ f.arch }}</td>

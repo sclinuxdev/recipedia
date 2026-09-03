@@ -26,36 +26,14 @@ impl State {
     }
 }
 
-/// Segment-wise comparison the way sage orders versions: digit-led chunks
-/// compare numerically, everything else lexically. `"1.10" > "1.9"`,
-/// `"22.1.8-3" > "22.1.8-2"`.
+/// Compare versions with Sage 0.4's version algebra. Bare upstream versions
+/// are accepted for the presentation layer and receive release zero.
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let mut ai = a.split(['.', '-']);
-    let mut bi = b.split(['.', '-']);
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                let ord = match (numeric(x), numeric(y)) {
-                    (Some(nx), Some(ny)) => nx.cmp(&ny),
-                    _ => x.cmp(y),
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-        }
-    }
-}
-
-fn numeric(s: &str) -> Option<u64> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
+    use std::str::FromStr;
+    let parse = |value: &str| {
+        sage_core::Version::from_str(value).unwrap_or_else(|_| sage_core::Version::new(0, value, 0))
+    };
+    parse(a).cmp(&parse(b))
 }
 
 pub fn derive(
@@ -63,12 +41,31 @@ pub fn derive(
     recipe_release: &str,
     published: Option<(&str, &str)>,
 ) -> State {
-    let Some((pub_ver, pub_rel)) = published else {
+    derive_with_epoch(
+        0,
+        recipe_version,
+        recipe_release,
+        published.map(|(version, release)| (0, version, release)),
+    )
+}
+
+/// Sage's epoch is part of the version coordinate and must win over any
+/// upstream/release comparison.
+pub fn derive_with_epoch(
+    recipe_epoch: u32,
+    recipe_version: &str,
+    recipe_release: &str,
+    published: Option<(u32, &str, &str)>,
+) -> State {
+    let Some((pub_epoch, pub_ver, pub_rel)) = published else {
         return State::Missing;
     };
-    match compare_versions(
-        &format!("{pub_ver}-{pub_rel}"),
-        &format!("{recipe_version}-{recipe_release}"),
+    match sage_core::Version::new(pub_epoch, pub_ver, pub_rel.parse().unwrap_or(0)).cmp(
+        &sage_core::Version::new(
+            recipe_epoch,
+            recipe_version,
+            recipe_release.parse().unwrap_or(0),
+        ),
     ) {
         std::cmp::Ordering::Less => State::Outdated,
         std::cmp::Ordering::Equal => State::Built,

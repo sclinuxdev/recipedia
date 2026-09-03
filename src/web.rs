@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use askama::Template;
@@ -11,13 +11,12 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::StreamExt;
-use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::db::{self, PackageRow, PublishedRow, SyncEntry};
+use crate::db::{self, Database, PackageRow, PublishedRow, SyncEntry};
 use crate::repo;
-use crate::status::{derive, State as BuildState};
+use crate::status::{derive_with_epoch, State as BuildState};
 use crate::sync;
 
 /// Uploads are streamed straight to disk; the ceiling only guards against
@@ -25,7 +24,7 @@ use crate::sync;
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    pub db: Arc<Database>,
     pub config: Config,
     /// Set while a sync runs so webhook + poll + boot never double-sync.
     pub syncing: AtomicBool,
@@ -56,7 +55,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/webhook/github", post(github_webhook))
         .route(
             "/api/repo/publish/{filename}",
-            post(publish)
+            get(publish_info)
+                .post(publish)
                 .delete(unpublish_file)
                 .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
@@ -156,17 +156,22 @@ impl PackageView {
 }
 
 fn package_views(
-    conn: &Connection,
+    database: &Database,
     filter: impl Fn(&PackageRow) -> bool,
 ) -> Result<Vec<PackageView>> {
-    let published = published_by_name(conn)?;
-    let rows = db::latest_packages(conn)?;
+    let published = published_by_name(database)?;
+    let rows = db::latest_packages(database)?;
     Ok(rows
         .iter()
         .filter(|r| filter(r))
         .map(|r| {
-            let published =
-                pick_published(published.get(&r.name).map(Vec::as_slice), &r.arch, None);
+            let published = pick_published(
+                published.get(&r.name).map(Vec::as_slice),
+                &r.arch,
+                &r.channel,
+                &r.slot,
+                None,
+            );
             PackageView {
                 name: r.name.clone(),
                 arch: r.arch.clone(),
@@ -175,10 +180,11 @@ fn package_views(
                 version: r.version.clone(),
                 release: r.release.clone(),
                 description: r.description.clone(),
-                state: derive(
+                state: derive_with_epoch(
+                    r.epoch,
                     &r.version,
                     &r.release,
-                    published.map(|p| (p.version.as_str(), p.release.as_str())),
+                    published.map(|p| (p.epoch, p.version.as_str(), p.release.as_str())),
                 ),
                 repo_version: published
                     .map(|p| format!("{}-{}", p.version, p.release))
@@ -196,10 +202,16 @@ fn arch_match(recipe_arch: &str, pub_arch: &str) -> bool {
     recipe_arch == pub_arch || recipe_arch == "any" || pub_arch == "any"
 }
 
+fn channel_match(recipe_channel: &str, published_channel: &str) -> bool {
+    recipe_channel == published_channel
+        || recipe_channel.rsplit('/').next() == Some(published_channel)
+        || published_channel.rsplit('/').next() == Some(recipe_channel)
+}
+
 /// All latest builds for one name (canonicalized arch per row).
-fn published_by_name(conn: &Connection) -> Result<HashMap<String, Vec<PublishedRow>>> {
+fn published_by_name(database: &Database) -> Result<HashMap<String, Vec<PublishedRow>>> {
     let mut out: HashMap<String, Vec<PublishedRow>> = HashMap::new();
-    for mut row in db::published_latest_by_arch(conn)? {
+    for mut row in db::published_latest_by_arch(database)? {
         row.arch = crate::model::canonical_arch(&row.arch).to_string();
         out.entry(row.name.clone()).or_default().push(row);
     }
@@ -212,12 +224,15 @@ fn published_by_name(conn: &Connection) -> Result<HashMap<String, Vec<PublishedR
 fn pick_published<'a>(
     rows: Option<&'a [PublishedRow]>,
     recipe_arch: &str,
+    recipe_channel: &str,
+    recipe_slot: &str,
     want_same_version: Option<&str>,
 ) -> Option<&'a PublishedRow> {
     let rows = rows?;
     let mut compatible: Vec<&PublishedRow> = rows
         .iter()
         .filter(|p| arch_match(recipe_arch, &p.arch))
+        .filter(|p| channel_match(recipe_channel, &p.channel) && p.slot == recipe_slot)
         .collect();
     if compatible.is_empty() {
         return None;
@@ -445,15 +460,16 @@ async fn package_detail(
         // merely the most recent upload (an old rebuild must not flip it).
         let best_pub = published.iter().max_by(|a, b| {
             crate::status::compare_versions(
-                &format!("{}-{}", a.version, a.release),
-                &format!("{}-{}", b.version, b.release),
+                &format!("{}:{}-{}", a.epoch, a.version, a.release),
+                &format!("{}:{}-{}", b.epoch, b.version, b.release),
             )
             .then(a.uploaded_at.cmp(&b.uploaded_at))
         });
-        let st = derive(
+        let st = derive_with_epoch(
+            pkg.epoch,
             &pkg.version,
             &pkg.release,
-            best_pub.map(|p| (p.version.as_str(), p.release.as_str())),
+            best_pub.map(|p| (p.epoch, p.version.as_str(), p.release.as_str())),
         );
         let ladder = versions
             .iter()
@@ -529,14 +545,14 @@ pub struct VirtualTemplate {
 }
 
 fn render_virtual(
-    conn: &Connection,
+    database: &Database,
     name: &str,
     provider_names: &[String],
     nav: Nav,
 ) -> Result<Response> {
     let wanted: std::collections::HashSet<&str> =
         provider_names.iter().map(String::as_str).collect();
-    let providers = package_views(conn, |r| wanted.contains(r.name.as_str()))?
+    let providers = package_views(database, |r| wanted.contains(r.name.as_str()))?
         .into_iter()
         .map(|v| ProviderView {
             name: v.name,
@@ -558,10 +574,12 @@ fn render_virtual(
 
 /// A pseudo-recipe row for a package that exists only in the repository:
 /// identity and metadata come from its manifest, dependency fields stay empty.
-fn orphan_row(conn: &Connection, row: &PublishedRow) -> Result<PackageRow> {
-    let meta = db::published_meta(conn, &row.filename)?;
+fn orphan_row(database: &Database, row: &PublishedRow) -> Result<PackageRow> {
+    let meta = db::published_meta(database, &row.filename)?;
     Ok(PackageRow {
         name: row.name.clone(),
+        slot: row.slot.clone(),
+        epoch: row.epoch,
         arch: crate::model::canonical_arch(&row.arch).to_string(),
         origin: String::new(),
         category: "orphan".into(),
@@ -771,7 +789,7 @@ fn authorize(state: &SharedState, headers: &HeaderMap) -> Result<String, Box<Res
             (StatusCode::UNAUTHORIZED, "missing bearer token").into_response(),
         ));
     };
-    match db::token_label(&state.db.lock().expect("db mutex poisoned"), token) {
+    match db::token_label(&state.db, token) {
         Ok(Some(label)) => Ok(label),
         Ok(None) => Err(Box::new(
             (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
@@ -853,9 +871,8 @@ async fn publish(
     let ingest_name = filename.clone();
     let staged = tmp_path.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().expect("publish worker: db mutex poisoned");
         repo::ingest(
-            &conn,
+            &state.db,
             &config,
             &staged,
             &ingest_name,
@@ -883,6 +900,36 @@ async fn publish(
     }
 }
 
+/// Authenticated metadata probe used by the publisher CLI for idempotent
+/// uploads. The public package path is channel-qualified, so probing by
+/// filename here avoids guessing the network-repository subchannel.
+async fn publish_info(
+    State(state): State<SharedState>,
+    AxPath(filename): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    if !repo::valid_filename(&filename) {
+        return (StatusCode::BAD_REQUEST, "invalid package filename").into_response();
+    }
+    match db::published_sha256(&state.db, &filename) {
+        Ok(Some(sha256)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ETAG, format!("\"{sha256}\""))
+            .header(header::CONTENT_LENGTH, 0)
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("database error: {error:#}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Withdraw a published artifact (token required): DB rows, build log, file,
 /// re-index. The repository stays a curated space, not an append-only dump.
 async fn unpublish_file(
@@ -897,10 +944,7 @@ async fn unpublish_file(
     if !repo::valid_filename(&filename) {
         return (StatusCode::BAD_REQUEST, "invalid package filename").into_response();
     }
-    let exists = {
-        let conn = state.db.lock().expect("db mutex poisoned");
-        db::published_sha256(&conn, &filename)
-    };
+    let exists = db::published_sha256(&state.db, &filename);
     match exists {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -920,14 +964,8 @@ async fn unpublish_file(
     }
     let config = state.config.clone();
     let target = filename.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = state
-            .db
-            .lock()
-            .expect("unpublish worker: db mutex poisoned");
-        repo::unpublish(&conn, &config, &target)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || repo::unpublish(&state.db, &config, &target)).await;
     match result {
         Ok(Ok(())) => json_response(&serde_json::json!({"deleted": filename, "by": builder})),
         Ok(Err(e)) => (
@@ -969,11 +1007,10 @@ async fn upload_log(
     };
     let target = filename.clone();
     let result: Result<usize> = (|| {
-        let conn = state.db.lock().expect("db mutex poisoned");
         // Only logs for things actually published: no orphans, no squatting.
-        match db::published_sha256(&conn, &target)? {
+        match db::published_sha256(&state.db, &target)? {
             Some(_) => {
-                db::log_upsert(&conn, &target, content.trim_end(), &builder).map(|_| body.len())
+                db::log_upsert(&state.db, &target, content.trim_end(), &builder).map(|_| body.len())
             }
             None => anyhow::bail!("{target} is not published"),
         }
@@ -988,8 +1025,8 @@ async fn upload_log(
     }
 }
 
-/// Static delivery of published packages and index.toml. ETag carries the
-/// stored sha256 so clients can skip re-uploads of unchanged files.
+/// Static delivery of published packages and Sage 0.4 network-repository
+/// index files. Package ETags carry the stored SHA-256.
 #[derive(Template)]
 #[template(path = "repo_index.html")]
 pub struct RepoIndexTemplate {
@@ -1001,8 +1038,8 @@ pub struct RepoIndexTemplate {
 /// Browsable listing of everything published: this is what
 /// `https://repo.<host>/` renders (and `/repo/` on the main site).
 async fn repo_index(State(state): State<SharedState>) -> Response {
-    with_conn(&state, |conn| {
-        let files = db::published_all(conn)?;
+    with_conn(&state, |database| {
+        let files = db::published_all(database)?;
         let bytes: i64 = files.iter().map(|f| f.size).sum();
         let tpl = RepoIndexTemplate {
             total_mib: format!("{:.1}", bytes as f64 / 1_048_576.0),
@@ -1020,23 +1057,30 @@ async fn repo_file(
 ) -> Response {
     if path
         .split('/')
-        .any(|seg| seg.is_empty() || seg == ".." || seg == ".")
+        .any(|seg| seg.is_empty() || seg == ".." || seg == "." || seg.starts_with(".incoming-"))
     {
         return StatusCode::NOT_FOUND.into_response();
     }
     let full = state.config.repo_dir.join(&path);
+    let configured_key = &state.config.repo_signing_key;
+    let configured_public_key = configured_key.with_extension("pub");
+    let key_is_requested = [configured_key, &configured_public_key]
+        .iter()
+        .any(|candidate| {
+            candidate == &&full
+                || (!candidate.is_absolute() && state.config.repo_dir.join(candidate) == full)
+        });
+    if key_is_requested {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let meta = match tokio::fs::metadata(&full).await {
         Ok(m) if m.is_file() => m,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let etag = if path == "index.toml" {
-        None // regenerated on every publish; no stable hash worth caching
-    } else {
-        match db::published_sha256(&state.db.lock().expect("db mutex poisoned"), &path) {
-            Ok(Some(sha)) => Some(sha),
-            _ => None,
-        }
+    let etag = match db::published_sha256_for_path(&state.db, &path) {
+        Ok(Some(sha)) => Some(sha),
+        _ => None,
     };
     if let Some(sha) = &etag {
         if headers
@@ -1086,8 +1130,8 @@ struct ApiStatusEntry {
 }
 
 /// Short HEAD of the canonical recipes tree for the index page.
-fn commits_summary(conn: &Connection) -> Result<String> {
-    Ok(db::meta_get(conn, "last_commit")?
+fn commits_summary(database: &Database) -> Result<String> {
+    Ok(db::meta_get(database, "last_commit")?
         .map(|v| format!("recipes@{}", &v[..12.min(v.len())]))
         .unwrap_or_default())
 }
@@ -1116,15 +1160,18 @@ async fn api_package(State(state): State<SharedState>, AxPath(name): AxPath<Stri
             let published = pick_published(
                 published_by_name.get(&name).map(Vec::as_slice),
                 &pkg.arch,
+                &pkg.channel,
+                &pkg.slot,
                 None,
             );
             ApiStatusEntry {
                 name: pkg.name.clone(),
                 arch: pkg.arch.clone(),
-                state: derive(
+                state: derive_with_epoch(
+                    pkg.epoch,
                     &pkg.version,
                     &pkg.release,
-                    published.map(|p| (p.version.as_str(), p.release.as_str())),
+                    published.map(|p| (p.epoch, p.version.as_str(), p.release.as_str())),
                 ),
                 recipe_version: pkg.version.clone(),
                 recipe_release: pkg.release.clone(),
@@ -1154,15 +1201,18 @@ async fn api_status(State(app): State<SharedState>) -> Response {
                 let published = pick_published(
                     published.get(&r.name).map(Vec::as_slice),
                     &r.arch,
+                    &r.channel,
+                    &r.slot,
                     Some(&r.version),
                 );
                 ApiStatusEntry {
                     name: r.name.clone(),
                     arch: r.arch.clone(),
-                    state: derive(
+                    state: derive_with_epoch(
+                        r.epoch,
                         &r.version,
                         &r.release,
-                        published.map(|p| (p.version.as_str(), p.release.as_str())),
+                        published.map(|p| (p.epoch, p.version.as_str(), p.release.as_str())),
                     ),
                     recipe_version: r.version.clone(),
                     recipe_release: r.release.clone(),
@@ -1217,14 +1267,9 @@ pub async fn trigger_sync(state: SharedState, trigger: &'static str) -> Response
     }
     let config = state.config.clone();
     let worker_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = worker_state
-            .db
-            .lock()
-            .expect("sync worker: db mutex poisoned");
-        sync::run_sync(&conn, &config, trigger)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || sync::run_sync(&worker_state.db, &config, trigger))
+            .await;
     state.syncing.store(false, Ordering::SeqCst);
     match result {
         Ok(Ok(report)) => (StatusCode::OK, format!("synced: {}", report.summary())).into_response(),
@@ -1266,12 +1311,11 @@ fn verify_hmac(secret: &str, signature: &str, body: &[u8]) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn with_conn<T>(state: &SharedState, f: impl FnOnce(&Connection) -> Result<T>) -> Response
+fn with_conn<T>(state: &SharedState, f: impl FnOnce(&Database) -> Result<T>) -> Response
 where
     T: IntoResponse,
 {
-    let conn = state.db.lock().expect("db mutex poisoned");
-    match f(&conn) {
+    match f(&state.db) {
         Ok(response) => response.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

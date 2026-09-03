@@ -9,8 +9,13 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Root holding the read-only git mirrors and the published packages.
     pub state_dir: PathBuf,
-    /// Published binary packages: `*.pkg.tar.zst` + regenerated index.toml.
+    /// Published binary packages and Sage network-repository indexes.
     pub repo_dir: PathBuf,
+    /// Logical root channel for unqualified package channels (`system` becomes
+    /// `main/system`; the root itself is represented by ChannelsConfig.url).
+    pub repo_channel: String,
+    /// Raw 32-byte Ed25519 private key used to sign Sage index.mdb files.
+    pub repo_signing_key: PathBuf,
     /// The one canonical recipes tree. Architecture is part of each recipe's
     /// path and declaration, never inferred from a repository name.
     pub git_url: String,
@@ -39,9 +44,15 @@ impl Config {
             listen: env_or("RECIPEEDIA_LISTEN", "127.0.0.1:8300"),
             db_path: PathBuf::from(env_or(
                 "RECIPEEDIA_DB",
-                &state_dir.join("recipedia.sqlite").display().to_string(),
+                &state_dir.join("database").display().to_string(),
             )),
             repo_dir: state_dir.join("repo"),
+            repo_channel: env_or("RECIPEEDIA_REPO_CHANNEL", "main"),
+            repo_signing_key: std::env::var("RECIPEEDIA_REPO_SIGNING_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state_dir.join("signing.key")),
             state_dir,
             git_url: env_or("RECIPEEDIA_GIT_URL", DEFAULT_GIT_URL),
             webhook_secret: std::env::var("RECIPEEDIA_WEBHOOK_SECRET").ok(),
@@ -73,6 +84,8 @@ mod tests {
             db_path: PathBuf::new(),
             state_dir: PathBuf::from("/state"),
             repo_dir: PathBuf::new(),
+            repo_channel: "main".into(),
+            repo_signing_key: PathBuf::new(),
             git_url: DEFAULT_GIT_URL.to_string(),
             webhook_secret: None,
             poll_secs: 600,

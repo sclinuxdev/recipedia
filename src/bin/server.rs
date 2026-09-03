@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -18,8 +18,8 @@ async fn main() -> Result<()> {
                 .get(1)
                 .context("usage: recipedia-server token <label>")?;
             let config = Config::from_env();
-            let conn = db::open(&config.db_path)?;
-            let token = db::token_create(&conn, label)?;
+            let database = db::open(&config.db_path)?;
+            let token = db::token_create(&database, label)?;
             println!("{token}");
             println!("(store it now — only its SHA-256 is kept)");
             Ok(())
@@ -32,9 +32,9 @@ async fn serve() -> Result<()> {
     let config = Config::from_env();
     std::fs::create_dir_all(&config.state_dir)?;
     std::fs::create_dir_all(&config.repo_dir)?;
-    let conn = db::open(&config.db_path)?;
+    let database = Arc::new(db::open(&config.db_path)?);
     let state: SharedState = Arc::new(AppState {
-        db: Mutex::new(conn),
+        db: database,
         config: config.clone(),
         syncing: AtomicBool::new(false),
     });
@@ -44,12 +44,9 @@ async fn serve() -> Result<()> {
     {
         let st = state.clone();
         let trigger = "boot".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = st.db.lock().expect("boot sync: db mutex poisoned");
-            match sync::run_sync(&conn, &st.config, &trigger) {
-                Ok(report) => println!("boot sync: {}", report.summary()),
-                Err(err) => eprintln!("boot sync failed: {err:#}"),
-            }
+        tokio::task::spawn_blocking(move || match sync::run_sync(&st.db, &st.config, &trigger) {
+            Ok(report) => println!("boot sync: {}", report.summary()),
+            Err(err) => eprintln!("boot sync failed: {err:#}"),
         });
     }
 
@@ -69,13 +66,10 @@ async fn serve() -> Result<()> {
                 let probe = {
                     let st = st.clone();
                     tokio::task::spawn_blocking(move || {
-                        let stored = {
-                            let conn = st.db.lock().expect("poll: db mutex poisoned");
-                            db::meta_get(&conn, "last_commit")
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default()
-                        };
+                        let stored = db::meta_get(&st.db, "last_commit")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         let url = st.config.git_url.clone();
                         (url.clone(), sync::remote_head(&url), stored)
                     })
